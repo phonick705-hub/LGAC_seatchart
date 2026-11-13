@@ -1,0 +1,114 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isCompanyUser() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email is string &&
+        request.auth.token.email.lower().matches('^[^@\\s]+@lgart[.]com$');
+    }
+
+    function isValidTheaterLayout(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'name',
+        'shareCode',
+        'version',
+        'schemaVersion',
+        'canvasWidth',
+        'canvasHeight',
+        'gridSize',
+        'snapToGrid',
+        'seatCount',
+        'seats',
+        'labels',
+        'legend',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'name',
+        'shareCode',
+        'version',
+        'schemaVersion',
+        'canvasWidth',
+        'canvasHeight',
+        'gridSize',
+        'snapToGrid',
+        'seatCount',
+        'seats',
+        'labels',
+        'legend',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+      data.shareCode is string && data.shareCode.size() >= 4 && data.shareCode.size() <= 32 && data.shareCode.matches('^[A-Z0-9\\-]+$') &&
+      data.version is number && data.version >= 1 && data.version <= 100 &&
+      data.schemaVersion is number && data.schemaVersion >= 1 && data.schemaVersion <= 100 &&
+      data.canvasWidth is number && data.canvasWidth >= 200 && data.canvasWidth <= 5000 &&
+      data.canvasHeight is number && data.canvasHeight >= 200 && data.canvasHeight <= 5000 &&
+      data.gridSize is number && data.gridSize >= 1 && data.gridSize <= 100 &&
+      data.snapToGrid is bool &&
+      data.seatCount is number && data.seatCount >= 0 && data.seatCount <= 5000 &&
+      data.seats is list && data.seats.size() <= 5000 && (data.seats.size() == 0 || data.seats[0] is map) &&
+      data.labels is list && data.labels.size() <= 200 && (data.labels.size() == 0 || data.labels[0] is map) &&
+      data.legend is list && data.legend.size() <= 100 && (data.legend.size() == 0 || data.legend[0] is map) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    match /theaterLayouts/{layoutId} {
+      allow get: if isCompanyUser() && isValidId(layoutId);
+      allow list: if isCompanyUser();
+      allow create: if isCompanyUser() && isValidId(layoutId) && isValidTheaterLayout(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isCompanyUser() && isValidId(layoutId) && isValidTheaterLayout(incoming()) && (
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().shareCode == existing().shareCode &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'version',
+          'schemaVersion',
+          'canvasWidth',
+          'canvasHeight',
+          'gridSize',
+          'snapToGrid',
+          'seatCount',
+          'seats',
+          'labels',
+          'legend',
+          'updatedAt'
+        ])
+      );
+      allow delete: if isCompanyUser() && isValidId(layoutId) && existing().ownerId == request.auth.uid;
+    }
+  }
+}

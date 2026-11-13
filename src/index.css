@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+/* 2페이지 상단 미니 헤더: 완전 숨김 (1페이지 단일 통합 문서) */
+.print-page-2-header {
+  display: none !important;
+}
+
+@media print {
+  /* 1. 상단의 웹 헤더, 입력 필드, 등급 선택 툴바, 내보내기 버튼 등 인쇄 시 불필요한 컨트롤 영역 숨김 */
+  .no-print,
+  header,
+  nav,
+  footer,
+  input,
+  textarea,
+  [role="alert"],
+  .fixed {
+    display: none !important;
+  }
+
+  header *,
+  nav *,
+  .no-print * {
+    display: none !important;
+  }
+
+  /* 2. 브라우저 인쇄 환경 설정: A3 세로 1페이지 (Portrait: 297mm x 420mm - 단체명 및 도면 확대 출력) */
+  @page {
+    size: A3 portrait;
+    margin: 6mm 8mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-height: 100% !important;
+    overflow: hidden !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  div.min-h-screen {
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    min-height: auto !important;
+    height: 100% !important;
+    max-height: 100% !important;
+    overflow: hidden !important;
+  }
+
+  main {
+    max-width: 100% !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    page-break-before: avoid !important;
+    break-before: avoid !important;
+  }
+
+  /* 3. 하단 컨테이너 블록(seat-map-print-container)이 A3 세로 1장에 큼직하게 꽉 차도록 zoom 0.77 확대 스케일링 */
+  .seat-map-print-container {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 auto !important;
+    padding: 2px 4px !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: #ffffff !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    page-break-before: avoid !important;
+    break-before: avoid !important;
+    zoom: 0.77;
+    transform: none !important;
+  }
+
+  /* 단체명 / 좌석배치도 메인 제목: 인쇄 시 큼직하고 선명하게 확대 */
+  .seat-map-print-title {
+    font-size: 26pt !important;
+    font-weight: 900 !important;
+    line-height: 1.2 !important;
+    color: #0f172a !important;
+    letter-spacing: -0.02em !important;
+  }
+
+  /* 도면 내부의 좌석 버튼들이 숨겨지지 않고 선명하게 출력되도록 보장 */
+  .seat-map-print-container button:not(.no-print) {
+    display: flex !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* 가로 스크롤 해제 및 중앙 정렬 */
+  .seat-map-print-container .overflow-x-auto {
+    overflow: visible !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    display: flex !important;
+    justify-content: center !important;
+    padding-bottom: 0 !important;
+    margin: 0 !important;
+  }
+
+  .seat-map-print-container .w-fit {
+    min-width: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "에디트기능추가_ 예매 좌석 번호 정리기(티켓용)_시그니처+유플",
+  "description": "예매 시스템에서 복사한 좌석 내역을 등급 및 열별로 좌석배치도에 표기해주는 기능",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

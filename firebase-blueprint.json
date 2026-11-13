@@ -1,0 +1,105 @@
+{
+  "entities": {
+    "TheaterLayout": {
+      "title": "TheaterLayout",
+      "description": "A user-created custom theater seat map layout with seats, stage/text labels, and color legend.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the user who owns this layout document.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the theater seat layout.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "shareCode": {
+          "type": "string",
+          "description": "Unique share code associated with this layout document.",
+          "minLength": 4,
+          "maxLength": 32,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "version": {
+          "type": "number",
+          "description": "Layout data version number."
+        },
+        "schemaVersion": {
+          "type": "number",
+          "description": "Schema version number for migration."
+        },
+        "canvasWidth": {
+          "type": "number",
+          "description": "SVG canvas width in pixels."
+        },
+        "canvasHeight": {
+          "type": "number",
+          "description": "SVG canvas height in pixels."
+        },
+        "gridSize": {
+          "type": "number",
+          "description": "Snap grid size in pixels."
+        },
+        "snapToGrid": {
+          "type": "boolean",
+          "description": "Whether snap-to-grid is enabled."
+        },
+        "seatCount": {
+          "type": "number",
+          "description": "Count of active (non-disabled) seats."
+        },
+        "seats": {
+          "type": "array",
+          "description": "List of seat objects in the theater layout."
+        },
+        "labels": {
+          "type": "array",
+          "description": "List of stage banner and text label objects."
+        },
+        "legend": {
+          "type": "array",
+          "description": "List of color legend entries."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the layout was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the layout was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "shareCode",
+        "version",
+        "schemaVersion",
+        "canvasWidth",
+        "canvasHeight",
+        "gridSize",
+        "snapToGrid",
+        "seatCount",
+        "seats",
+        "labels",
+        "legend",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/theaterLayouts/{layoutId}": {
+      "schema": {
+        "$ref": "#/entities/TheaterLayout"
+      },
+      "description": "Private custom theater seat layouts owned by authenticated users."
+    }
+  }
+}
