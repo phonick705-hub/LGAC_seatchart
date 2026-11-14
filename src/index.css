@@ -77,7 +77,7 @@
     break-before: avoid !important;
   }
 
-  /* 3. 하단 컨테이너 블록(seat-map-print-container)이 A3 세로 1장에 큼직하게 꽉 차도록 zoom 0.77 확대 스케일링 */
+  /* 3. 하단 컨테이너 블록(seat-map-print-container)이 A3 세로 1장에 짤리지 않고 꽉 차도록 zoom 0.7469(기존 대비 97% 배율) 스케일링 */
   .seat-map-print-container {
     display: block !important;
     width: 100% !important;
@@ -93,7 +93,7 @@
     break-after: avoid !important;
     page-break-before: avoid !important;
     break-before: avoid !important;
-    zoom: 0.77;
+    zoom: 0.7469;
     transform: none !important;
   }
 

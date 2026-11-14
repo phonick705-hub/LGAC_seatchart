@@ -50,6 +50,7 @@ import {
 import {
   collection,
   doc,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -88,6 +89,7 @@ import {
   createBlankLayout,
   createLGSignatureHallCopy,
   createUPlusStageCopy,
+  createSecondChildSavedLayout,
   cloneLayoutWithNewIds,
   CURRENT_SCHEMA_VERSION,
   DEFAULT_SEAT_COLOR,
@@ -95,12 +97,17 @@ import {
   DEFAULT_STAGE_TEXT_COLOR,
   DEFAULT_STAGE_BORDER_COLOR,
   DEFAULT_LABEL_TEXT_COLOR,
+  SECOND_CHILD_DOC_ID,
+  SECOND_CHILD_SHARE_CODE,
+  SECOND_CHILD_DELETED_STORAGE_KEY,
+  isSecondChildEditorEmail,
   isValidHexColor,
   getReadableTextColor,
   sanitizeAndMigrateLayout,
   generateValidFirestoreDocId,
   generateShareCode,
   stripUndefinedDeep,
+  formatLayoutUpdatedAtShort,
 } from './customTemplates';
 
 interface GradeStyle {
@@ -136,6 +143,24 @@ interface CustomTheaterCanvasProps {
   onRequestSignOut?: () => void;
   pendingShareCode?: string | null;
   onConsumePendingShareCode?: () => void;
+  savedLayoutsProp?: SavedCustomLayout[];
+  isLoadingSavedLayoutsProp?: boolean;
+  savedLayoutsErrorProp?: string | null;
+  hasSyncedSavedLayoutsProp?: boolean;
+  publicLayoutsProp?: SavedCustomLayout[];
+  isLoadingPublicLayoutsProp?: boolean;
+  publicLayoutsErrorProp?: string | null;
+  onSavedLayoutUpsert?: (item: SavedCustomLayout, isNewlyCreated?: boolean) => void;
+  onSavedLayoutRemove?: (docId: string) => void;
+  onRefreshSavedLayouts?: (targetUser?: User | null) => Promise<void> | void;
+  onRefreshPublicLayouts?: (targetUser?: User | null) => Promise<void> | void;
+  onActiveLayoutChange?: (docId: string | null, layoutName: string) => void;
+  externalLoadRequest?:
+    | { type: 'saved'; item: SavedCustomLayout; nonce: number }
+    | { type: 'public_copy'; item: SavedCustomLayout; nonce: number }
+    | { type: 'blank'; nonce: number }
+    | null;
+  onConsumeExternalLoadRequest?: () => void;
 }
 
 const LOCAL_STORAGE_KEY = 'custom_theater_layout_v1';
@@ -284,6 +309,20 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
   onRequestSignOut,
   pendingShareCode,
   onConsumePendingShareCode,
+  savedLayoutsProp,
+  isLoadingSavedLayoutsProp,
+  savedLayoutsErrorProp,
+  hasSyncedSavedLayoutsProp,
+  publicLayoutsProp,
+  isLoadingPublicLayoutsProp,
+  publicLayoutsErrorProp,
+  onSavedLayoutUpsert,
+  onSavedLayoutRemove,
+  onRefreshSavedLayouts,
+  onRefreshPublicLayouts,
+  onActiveLayoutChange,
+  externalLoadRequest,
+  onConsumeExternalLoadRequest,
 }) => {
   // 1. Layout State & Document Identity (always starts clean; prompts if autosave draft exists)
   const [initialBootstrap] = useState<{
@@ -309,6 +348,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     useState<CustomAutosaveDraft | null>(() => {
       if (
         pendingShareCode ||
+        externalLoadRequest?.type === 'saved' ||
         (pendingRedirectAction && pendingRedirectAction.action !== 'loginOnly')
       ) {
         return null;
@@ -328,9 +368,60 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
   const [isReauthPrompt, setIsReauthPrompt] = useState<boolean>(false);
   const [authErrorMessage, setAuthErrorMessage] = useState<string | null>(null);
-  const [savedLayouts, setSavedLayouts] = useState<SavedCustomLayout[]>([]);
-  const [isLoadingSavedLayouts, setIsLoadingSavedLayouts] = useState<boolean>(false);
-  const [savedLayoutsError, setSavedLayoutsError] = useState<string | null>(null);
+  const [internalSavedLayouts, setInternalSavedLayouts] = useState<SavedCustomLayout[]>([]);
+  const [internalIsLoadingSavedLayouts, setInternalIsLoadingSavedLayouts] = useState<boolean>(false);
+  const [internalSavedLayoutsError, setInternalSavedLayoutsError] = useState<string | null>(null);
+  const hasExternalSavedLayouts = savedLayoutsProp !== undefined;
+  const savedLayouts = savedLayoutsProp ?? internalSavedLayouts;
+  const isLoadingSavedLayouts =
+    isLoadingSavedLayoutsProp ?? internalIsLoadingSavedLayouts;
+  const savedLayoutsError =
+    savedLayoutsErrorProp !== undefined
+      ? savedLayoutsErrorProp
+      : internalSavedLayoutsError;
+
+  const [internalPublicLayouts, setInternalPublicLayouts] = useState<SavedCustomLayout[]>([]);
+  const [internalIsLoadingPublicLayouts, setInternalIsLoadingPublicLayouts] = useState<boolean>(false);
+  const [internalPublicLayoutsError, setInternalPublicLayoutsError] = useState<string | null>(null);
+  const hasExternalPublicLayouts = publicLayoutsProp !== undefined;
+  const rawPublicLayouts = publicLayoutsProp ?? internalPublicLayouts;
+  const publicLayouts = useMemo(() => {
+    if (hasExternalPublicLayouts) return rawPublicLayouts;
+    if (rawPublicLayouts.some((item) => item.id === SECOND_CHILD_DOC_ID)) {
+      return rawPublicLayouts;
+    }
+    let deletedLocally = false;
+    try {
+      deletedLocally = localStorage.getItem(SECOND_CHILD_DELETED_STORAGE_KEY) === 'true';
+    } catch {
+      deletedLocally = false;
+    }
+    if (deletedLocally && isSecondChildEditorEmail(user?.email)) {
+      return rawPublicLayouts;
+    }
+    return [createSecondChildSavedLayout(), ...rawPublicLayouts];
+  }, [hasExternalPublicLayouts, rawPublicLayouts, user]);
+  const isLoadingPublicLayouts =
+    isLoadingPublicLayoutsProp ?? internalIsLoadingPublicLayouts;
+  const publicLayoutsError =
+    publicLayoutsErrorProp !== undefined
+      ? publicLayoutsErrorProp
+      : internalPublicLayoutsError;
+
+  const canEditLayoutItem = useCallback(
+    (item: SavedCustomLayout, targetUser?: User | null): boolean => {
+      if (!targetUser || !isAllowedCompanyUser(targetUser)) return false;
+      if (item.id === SECOND_CHILD_DOC_ID) {
+        return (
+          isSecondChildEditorEmail(targetUser.email) &&
+          (!item.ownerId || item.ownerId === targetUser.uid)
+        );
+      }
+      return item.ownerId === targetUser.uid;
+    },
+    []
+  );
+
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
 
@@ -433,6 +524,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
   const [showSaveModal, setShowSaveModal] = useState<boolean>(false);
   const [saveModalMode, setSaveModalMode] = useState<'first_save' | 'save_as'>('first_save');
   const [saveNameInput, setSaveNameInput] = useState<string>('');
+  const [saveAsPublicInput, setSaveAsPublicInput] = useState<boolean>(false);
   const [showShareCodeModal, setShowShareCodeModal] = useState<boolean>(false);
   const [shareCodeInput, setShareCodeInput] = useState<string>('');
   const [shareCodeError, setShareCodeError] = useState<string | null>(null);
@@ -472,6 +564,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       targetId: string | null;
       targetName: string;
       isNewDoc: boolean;
+      isPublic?: boolean;
       existingShareCode?: string;
     };
   } | null>(null);
@@ -605,13 +698,27 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
   }, []);
 
   const upsertSavedLayoutItem = useCallback(
-    (savedItem: SavedCustomLayout) => {
-      setSavedLayouts((prev) => {
-        const filtered = prev.filter((item) => item.id !== savedItem.id);
-        return sortSavedLayoutsDesc([savedItem, ...filtered]);
-      });
+    (savedItem: SavedCustomLayout, isNewlyCreated?: boolean) => {
+      if (onSavedLayoutUpsert) {
+        onSavedLayoutUpsert(savedItem, isNewlyCreated);
+      }
+      if (!hasExternalSavedLayouts) {
+        setInternalSavedLayouts((prev) => {
+          const filtered = prev.filter((item) => item.id !== savedItem.id);
+          return sortSavedLayoutsDesc([savedItem, ...filtered]);
+        });
+      }
+      if (!hasExternalPublicLayouts) {
+        setInternalPublicLayouts((prev) => {
+          const filtered = prev.filter((item) => item.id !== savedItem.id);
+          if (savedItem.isPublic) {
+            return sortSavedLayoutsDesc([savedItem, ...filtered]);
+          }
+          return filtered;
+        });
+      }
     },
-    [sortSavedLayoutsDesc]
+    [hasExternalPublicLayouts, hasExternalSavedLayouts, onSavedLayoutUpsert, sortSavedLayoutsDesc]
   );
 
   const parseLayoutDocSnapshot = useCallback(
@@ -619,6 +726,9 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       try {
         const createdIso = parseFirestoreTimestampIso(data.createdAt);
         const updatedIso = parseFirestoreTimestampIso(data.updatedAt || data.createdAt);
+        const isPublic = data.isPublic === true;
+        const ownerId = typeof data.ownerId === 'string' ? data.ownerId : undefined;
+        const ownerEmail = typeof data.ownerEmail === 'string' ? data.ownerEmail : undefined;
         const { layout: sanitized } = sanitizeAndMigrateLayout({
           version: typeof data.version === 'number' ? data.version : CURRENT_SCHEMA_VERSION,
           schemaVersion:
@@ -628,6 +738,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           name: typeof data.name === 'string' ? data.name : '새 커스텀 좌석배치도',
           savedId: docId,
           shareCode: typeof data.shareCode === 'string' ? data.shareCode : undefined,
+          isPublic,
           updatedAt: updatedIso,
           canvasWidth: typeof data.canvasWidth === 'number' ? data.canvasWidth : 1200,
           canvasHeight: typeof data.canvasHeight === 'number' ? data.canvasHeight : 800,
@@ -638,12 +749,16 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           legend: Array.isArray(data.legend) ? data.legend : [],
         });
         sanitized.savedId = docId;
+        sanitized.isPublic = isPublic;
         sanitized.shareCode =
           typeof data.shareCode === 'string' ? data.shareCode : sanitized.shareCode;
 
         return {
           id: docId,
           name: sanitized.name,
+          ownerId,
+          ownerEmail,
+          isPublic,
           shareCode: sanitized.shareCode,
           savedAt: createdIso,
           updatedAt: updatedIso,
@@ -663,10 +778,14 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
 
   const refreshSavedLayouts = useCallback(
     async (targetUser?: User | null) => {
+      if (onRefreshSavedLayouts) {
+        await onRefreshSavedLayouts(targetUser);
+        return;
+      }
       const activeUser = targetUser ?? user ?? auth.currentUser;
       if (!activeUser || !isAllowedCompanyUser(activeUser)) return;
-      setIsLoadingSavedLayouts(true);
-      setSavedLayoutsError(null);
+      setInternalIsLoadingSavedLayouts(true);
+      setInternalSavedLayoutsError(null);
       try {
         const layoutsQuery = query(
           collection(db, 'theaterLayouts'),
@@ -678,7 +797,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             parseLayoutDocSnapshot(docSnap.id, docSnap.data() as Record<string, unknown>)
           )
           .filter((item): item is SavedCustomLayout => item !== null);
-        setSavedLayouts((prev) => {
+        setInternalSavedLayouts((prev) => {
           const pendingId = justCreatedDocIdRef.current;
           if (pendingId && !items.some((item) => item.id === pendingId)) {
             const optimistic = prev.find((item) => item.id === pendingId);
@@ -691,34 +810,68 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           }
           return sortSavedLayoutsDesc(items);
         });
-        setSavedLayoutsError(null);
+        setInternalSavedLayoutsError(null);
       } catch (err) {
-        setSavedLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
+        setInternalSavedLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
         try {
           handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
         } catch {
           // Logged via handleFirestoreError; keep UI functional
         }
       } finally {
-        setIsLoadingSavedLayouts(false);
+        setInternalIsLoadingSavedLayouts(false);
       }
     },
-    [parseLayoutDocSnapshot, sortSavedLayoutsDesc, user]
+    [onRefreshSavedLayouts, parseLayoutDocSnapshot, sortSavedLayoutsDesc, user]
   );
 
-  // Subscribe to Firestore "내 배치도" collection for the signed-in user
+  // Sync current layout identity back to parent header dropdown
   useEffect(() => {
+    onActiveLayoutChange?.(currentLayoutId, layout.name);
+  }, [currentLayoutId, layout.name, onActiveLayoutChange]);
+
+  // Keep currentLayoutId consistent if external synced list confirms deletion on server
+  useEffect(() => {
+    if (!hasExternalSavedLayouts || !hasSyncedSavedLayoutsProp) return;
+    if (!currentLayoutId) return;
+    if (
+      currentLayoutId === SECOND_CHILD_DOC_ID &&
+      isSecondChildEditorEmail(user?.email) &&
+      publicLayouts.some((item) => item.id === SECOND_CHILD_DOC_ID)
+    ) {
+      return;
+    }
+    if (justCreatedDocIdRef.current === currentLayoutId) {
+      if (savedLayouts.some((item) => item.id === currentLayoutId)) {
+        justCreatedDocIdRef.current = null;
+      }
+      return;
+    }
+    if (!savedLayouts.some((item) => item.id === currentLayoutId)) {
+      setCurrentLayoutId(null);
+      setSavedSignature('');
+      setLayout((prev) => ({
+        ...prev,
+        savedId: undefined,
+        shareCode: undefined,
+      }));
+    }
+  }, [hasExternalSavedLayouts, hasSyncedSavedLayoutsProp, savedLayouts, publicLayouts, currentLayoutId, user]);
+
+  // Subscribe to Firestore "내 배치도" collection only when not provided by parent App
+  useEffect(() => {
+    if (hasExternalSavedLayouts) return;
     if (!authReady) return;
     if (!user || !isAllowedCompanyUser(user)) {
-      setSavedLayouts([]);
-      setSavedLayoutsError(null);
-      setIsLoadingSavedLayouts(false);
+      setInternalSavedLayouts([]);
+      setInternalSavedLayoutsError(null);
+      setInternalIsLoadingSavedLayouts(false);
       return;
     }
 
     let isEffectActive = true;
-    setIsLoadingSavedLayouts(true);
-    setSavedLayoutsError(null);
+    setInternalIsLoadingSavedLayouts(true);
+    setInternalSavedLayoutsError(null);
     const layoutsQuery = query(
       collection(db, 'theaterLayouts'),
       where('ownerId', '==', user.uid)
@@ -742,7 +895,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           justCreatedDocIdRef.current = null;
         }
 
-        setSavedLayouts((prev) => {
+        setInternalSavedLayouts((prev) => {
           if (
             snapshot.metadata.fromCache &&
             pendingCreatedId &&
@@ -755,14 +908,15 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           }
           return sortSavedLayoutsDesc(items);
         });
-        setSavedLayoutsError(null);
-        setIsLoadingSavedLayouts(false);
+        setInternalSavedLayoutsError(null);
+        setInternalIsLoadingSavedLayouts(false);
 
         const activeId = currentLayoutIdRef.current;
         if (
           activeId &&
           !snapshot.metadata.fromCache &&
           justCreatedDocIdRef.current !== activeId &&
+          !(activeId === SECOND_CHILD_DOC_ID && isSecondChildEditorEmail(user?.email)) &&
           !items.some((item) => item.id === activeId)
         ) {
           setCurrentLayoutId(null);
@@ -776,14 +930,13 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       },
       (err) => {
         if (!isEffectActive) return;
-        setIsLoadingSavedLayouts(false);
-        setSavedLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
+        setInternalIsLoadingSavedLayouts(false);
+        setInternalSavedLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
         try {
           handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
         } catch {
           // Logged via handleFirestoreError; keep UI functional
         }
-        // Attempt a one-time getDocs fallback in case watch stream errored transiently
         void (async () => {
           try {
             const fallbackSnap = await getDocs(layoutsQuery);
@@ -793,7 +946,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
                 parseLayoutDocSnapshot(docSnap.id, docSnap.data() as Record<string, unknown>)
               )
               .filter((item): item is SavedCustomLayout => item !== null);
-            setSavedLayouts((prev) => {
+            setInternalSavedLayouts((prev) => {
               const pendingId = justCreatedDocIdRef.current;
               if (pendingId && !fallbackItems.some((item) => item.id === pendingId)) {
                 const optimistic = prev.find((item) => item.id === pendingId);
@@ -803,7 +956,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
               }
               return sortSavedLayoutsDesc(fallbackItems);
             });
-            setSavedLayoutsError(null);
+            setInternalSavedLayoutsError(null);
           } catch {
             // Keep error banner so user can manually retry
           }
@@ -815,7 +968,111 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       isEffectActive = false;
       unsubscribe();
     };
-  }, [authReady, user, parseLayoutDocSnapshot, sortSavedLayoutsDesc]);
+  }, [hasExternalSavedLayouts, authReady, user, parseLayoutDocSnapshot, sortSavedLayoutsDesc]);
+
+  const refreshPublicLayouts = useCallback(
+    async (targetUser?: User | null) => {
+      if (onRefreshPublicLayouts) {
+        await onRefreshPublicLayouts(targetUser);
+        return;
+      }
+      const activeUser = targetUser ?? user ?? auth.currentUser;
+      if (!activeUser || !isAllowedCompanyUser(activeUser)) return;
+      setInternalIsLoadingPublicLayouts(true);
+      setInternalPublicLayoutsError(null);
+      try {
+        const publicQuery = query(
+          collection(db, 'theaterLayouts'),
+          where('isPublic', '==', true)
+        );
+        const snapshot = await getDocs(publicQuery);
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseLayoutDocSnapshot(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null && item.isPublic === true);
+        setInternalPublicLayouts(sortSavedLayoutsDesc(items));
+        setInternalPublicLayoutsError(null);
+      } catch (err) {
+        setInternalPublicLayoutsError('공용 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+      } finally {
+        setInternalIsLoadingPublicLayouts(false);
+      }
+    },
+    [onRefreshPublicLayouts, parseLayoutDocSnapshot, sortSavedLayoutsDesc, user]
+  );
+
+  // Subscribe to Firestore "공용 배치도" only when not provided by parent App
+  useEffect(() => {
+    if (hasExternalPublicLayouts) return;
+    if (!authReady) return;
+    if (!user || !isAllowedCompanyUser(user)) {
+      setInternalPublicLayouts([]);
+      setInternalPublicLayoutsError(null);
+      setInternalIsLoadingPublicLayouts(false);
+      return;
+    }
+
+    let isEffectActive = true;
+    setInternalIsLoadingPublicLayouts(true);
+    setInternalPublicLayoutsError(null);
+    const publicQuery = query(
+      collection(db, 'theaterLayouts'),
+      where('isPublic', '==', true)
+    );
+
+    const unsubscribe = onSnapshot(
+      publicQuery,
+      (snapshot) => {
+        if (!isEffectActive) return;
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseLayoutDocSnapshot(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null && item.isPublic === true);
+        setInternalPublicLayouts(sortSavedLayoutsDesc(items));
+        setInternalPublicLayoutsError(null);
+        setInternalIsLoadingPublicLayouts(false);
+      },
+      (err) => {
+        if (!isEffectActive) return;
+        setInternalIsLoadingPublicLayouts(false);
+        setInternalPublicLayoutsError('공용 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+        void (async () => {
+          try {
+            const fallbackSnap = await getDocs(publicQuery);
+            if (!isEffectActive) return;
+            const fallbackItems = fallbackSnap.docs
+              .map((docSnap) =>
+                parseLayoutDocSnapshot(docSnap.id, docSnap.data() as Record<string, unknown>)
+              )
+              .filter(
+                (item): item is SavedCustomLayout => item !== null && item.isPublic === true
+              );
+            setInternalPublicLayouts(sortSavedLayoutsDesc(fallbackItems));
+            setInternalPublicLayoutsError(null);
+          } catch {
+            // Keep error banner so user can manually retry
+          }
+        })();
+      }
+    );
+
+    return () => {
+      isEffectActive = false;
+      unsubscribe();
+    };
+  }, [hasExternalPublicLayouts, authReady, user, parseLayoutDocSnapshot, sortSavedLayoutsDesc]);
 
   const loadLayoutByShareCode = useCallback(
     async (
@@ -887,6 +1144,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
 
         if (isOwner) {
           sanitized.savedId = docSnap.id;
+          sanitized.isPublic = data.isPublic === true;
           sanitized.shareCode =
             typeof data.shareCode === 'string' ? data.shareCode : normalized;
           setCurrentLayoutId(docSnap.id);
@@ -2079,12 +2337,15 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     targetId: string | null;
     targetName: string;
     isNewDoc: boolean;
+    isPublic?: boolean;
     existingShareCode?: string;
     targetUser?: User;
     overrideLayout?: CustomTheaterLayout;
   }) => {
     const sourceLayout = options.overrideLayout || layout;
     const activeUser = options.targetUser || user || auth.currentUser;
+    const finalIsPublic =
+      options.isPublic !== undefined ? options.isPublic : Boolean(sourceLayout.isPublic);
     if (!activeUser) {
       pendingAuthActionRef.current = {
         type: 'retrySave',
@@ -2092,6 +2353,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
           targetId: options.targetId,
           targetName: options.targetName,
           isNewDoc: options.isNewDoc,
+          isPublic: finalIsPublic,
           existingShareCode: options.existingShareCode,
         },
       };
@@ -2109,12 +2371,22 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     }
 
     const docId =
-      options.isNewDoc || !options.targetId
+      options.isNewDoc && !options.targetId
         ? generateValidFirestoreDocId('layout')
-        : options.targetId;
-    const finalShareCode = options.isNewDoc
-      ? generateShareCode()
-      : options.existingShareCode || sourceLayout.shareCode || generateShareCode();
+        : options.targetId || generateValidFirestoreDocId('layout');
+
+    if (docId === SECOND_CHILD_DOC_ID && !isSecondChildEditorEmail(activeUser.email)) {
+      showToast('이 공용 배치도의 수정 권한이 없습니다.');
+      return;
+    }
+
+    const finalShareCode =
+      docId === SECOND_CHILD_DOC_ID
+        ? SECOND_CHILD_SHARE_CODE
+        : options.isNewDoc
+        ? generateShareCode()
+        : options.existingShareCode || sourceLayout.shareCode || generateShareCode();
+    const ownerEmail = (activeUser.email || '').trim();
 
     const safeCanvasWidth = Math.min(Math.max(Math.round(sourceLayout.canvasWidth || 1200), 200), 5000);
     const safeCanvasHeight = Math.min(Math.max(Math.round(sourceLayout.canvasHeight || 800), 200), 5000);
@@ -2152,6 +2424,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     const retryAction = (nextUser?: User) =>
       persistLayoutToFirestore({
         ...options,
+        isPublic: finalIsPublic,
         targetUser: nextUser || activeUser,
         overrideLayout: sourceLayout,
       });
@@ -2162,12 +2435,25 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     errorSignatureRef.current = null;
 
     const docPath = `theaterLayouts/${docId}`;
-    const opType = options.isNewDoc ? OperationType.CREATE : OperationType.UPDATE;
+    let shouldCreateDoc = options.isNewDoc;
+    if (!shouldCreateDoc && docId === SECOND_CHILD_DOC_ID) {
+      try {
+        const existingSnap = await getDoc(doc(db, 'theaterLayouts', docId));
+        if (!existingSnap.exists()) {
+          shouldCreateDoc = true;
+        }
+      } catch {
+        // Fallback to updateDoc below
+      }
+    }
+    const opType = shouldCreateDoc ? OperationType.CREATE : OperationType.UPDATE;
 
     try {
-      if (options.isNewDoc) {
+      if (shouldCreateDoc) {
         await setDoc(doc(db, 'theaterLayouts', docId), {
           ownerId: activeUser.uid,
+          ownerEmail,
+          isPublic: finalIsPublic,
           name: finalName,
           shareCode: finalShareCode,
           version: CURRENT_SCHEMA_VERSION,
@@ -2186,6 +2472,8 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       } else {
         await updateDoc(doc(db, 'theaterLayouts', docId), {
           name: finalName,
+          ownerEmail,
+          isPublic: finalIsPublic,
           version: CURRENT_SCHEMA_VERSION,
           schemaVersion: CURRENT_SCHEMA_VERSION,
           canvasWidth: safeCanvasWidth,
@@ -2215,6 +2503,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
         name: finalName,
         savedId: docId,
         shareCode: finalShareCode,
+        isPublic: finalIsPublic,
         updatedAt: nowIso,
       };
 
@@ -2222,6 +2511,9 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       const optimisticSavedItem: SavedCustomLayout = {
         id: docId,
         name: finalName,
+        ownerId: activeUser.uid,
+        ownerEmail,
+        isPublic: finalIsPublic,
         shareCode: finalShareCode,
         savedAt: options.isNewDoc ? nowIso : existingSaved?.savedAt || nowIso,
         updatedAt: nowIso,
@@ -2232,8 +2524,10 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       if (options.isNewDoc) {
         justCreatedDocIdRef.current = docId;
       }
-      upsertSavedLayoutItem(optimisticSavedItem);
-      setSavedLayoutsError(null);
+      upsertSavedLayoutItem(optimisticSavedItem, options.isNewDoc);
+      if (!hasExternalSavedLayouts) {
+        setInternalSavedLayoutsError(null);
+      }
       setCurrentLayoutId(docId);
       setLayout(updatedLayout);
       setSavedSignature(getLayoutContentSignature(updatedLayout));
@@ -2247,7 +2541,9 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
 
       if (options.isNewDoc) {
         showToast(
-          `'${finalName}' 배치도가 저장되었습니다. (공유 코드: ${finalShareCode})`
+          finalIsPublic
+            ? `'${finalName}' 배치도가 공용 배치도로 저장되었습니다. (공유 코드: ${finalShareCode})`
+            : `'${finalName}' 배치도가 저장되었습니다. (공유 코드: ${finalShareCode})`
         );
       } else {
         showToast(`'${finalName}' 배치도가 덮어쓰기 저장되었습니다.`);
@@ -2265,6 +2561,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             targetId: options.targetId,
             targetName: finalName,
             isNewDoc: options.isNewDoc,
+            isPublic: finalIsPublic,
             existingShareCode: options.existingShareCode,
           },
         };
@@ -2306,9 +2603,15 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     }
 
     const activeId = overrideLayout ? overrideLayout.savedId || null : currentLayoutId;
-    const matched = activeId
+    const matchedSaved = activeId
       ? savedLayouts.find((item) => item.id === activeId)
       : undefined;
+    const matchedEditablePublic = activeId
+      ? publicLayouts.find(
+          (item) => item.id === activeId && canEditLayoutItem(item, activeUser)
+        )
+      : undefined;
+    const matched = matchedSaved || matchedEditablePublic;
     const confirmedLayoutId =
       activeId &&
       (Boolean(matched) || justCreatedDocIdRef.current === activeId)
@@ -2321,6 +2624,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
         targetId: confirmedLayoutId,
         targetName,
         isNewDoc: false,
+        isPublic: matched?.isPublic ?? Boolean(targetLayout.isPublic),
         existingShareCode: matched?.shareCode || targetLayout.shareCode,
         targetUser: activeUser,
         overrideLayout: targetLayout,
@@ -2328,12 +2632,18 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     } else {
       if (currentLayoutId && !confirmedLayoutId) {
         setCurrentLayoutId(null);
-        setLayout((prev) => ({ ...prev, savedId: undefined, shareCode: undefined }));
+        setLayout((prev) => ({
+          ...prev,
+          savedId: undefined,
+          shareCode: undefined,
+          isPublic: undefined,
+        }));
       }
       setSaveErrorMessage(null);
       setSaveStatus((prev) => (prev === 'error' ? 'saved' : prev));
       setSaveModalMode('first_save');
       setSaveNameInput(targetLayout.name?.trim() || '새 커스텀 좌석배치도');
+      setSaveAsPublicInput(Boolean(targetLayout.isPublic));
       setShowSaveModal(true);
       setShowTemplateMenu(false);
     }
@@ -2357,6 +2667,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     setSaveStatus((prev) => (prev === 'error' ? 'saved' : prev));
     setSaveModalMode('save_as');
     setSaveNameInput(buildCopyName(targetLayout.name));
+    setSaveAsPublicInput(false);
     setShowSaveModal(true);
     setShowTemplateMenu(false);
   };
@@ -2376,6 +2687,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       targetId: string | null;
       targetName: string;
       isNewDoc: boolean;
+      isPublic?: boolean;
       existingShareCode?: string;
     }
   ) => {
@@ -2396,6 +2708,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             targetDocId: saveParams.targetId,
             targetName: saveParams.targetName,
             isNewDoc: saveParams.isNewDoc,
+            isPublic: saveParams.isPublic,
             existingShareCode: saveParams.existingShareCode,
           }
         : {
@@ -2519,6 +2832,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
         targetId: pendingRedirectAction.targetDocId ?? draft?.docId ?? null,
         targetName: pendingRedirectAction.targetName,
         isNewDoc: pendingRedirectAction.isNewDoc ?? !(pendingRedirectAction.targetDocId || draft?.docId),
+        isPublic: pendingRedirectAction.isPublic,
         existingShareCode: pendingRedirectAction.existingShareCode || draft?.shareCode,
         targetUser: user,
         overrideLayout: restoredLayout,
@@ -2780,6 +3094,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       });
       restored.savedId = item.id;
       restored.shareCode = item.shareCode;
+      restored.isPublic = item.isPublic;
       clearAutosaveDraft();
       applyNewLayoutToCanvas(
         restored,
@@ -2805,20 +3120,89 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
     }
   };
 
+  const requestLoadPublicLayoutCopy = (item: SavedCustomLayout) => {
+    setShowTemplateMenu(false);
+
+    const activeUser = user || auth.currentUser;
+    if (activeUser && canEditLayoutItem(item, activeUser)) {
+      requestLoadSavedLayout(item);
+      return;
+    }
+
+    const loadCopy = () => {
+      const { hadInvalidColors } = sanitizeAndMigrateLayout(item.layout);
+      const copied = cloneLayoutWithNewIds(item.layout, {
+        newName: buildCopyName(item.name),
+        preserveSavedId: false,
+      });
+      copied.isPublic = undefined;
+      copied.savedId = undefined;
+      copied.shareCode = undefined;
+      clearAutosaveDraft();
+      applyNewLayoutToCanvas(
+        copied,
+        hadInvalidColors
+          ? `'${item.name}' 공용 배치도를 복사본으로 불러왔습니다. (일부 잘못된 색상 값은 기본색으로 대체됨)`
+          : `'${item.name}' 공용 배치도를 복사본으로 불러왔습니다. 수정 후 [저장]하면 내 배치도로 저장됩니다.`,
+        {
+          docId: null,
+          markAsClean: true,
+        }
+      );
+    };
+
+    if (isDirty) {
+      setPendingConfirmAction({
+        title: '공용 배치도 복사본 불러오기',
+        message: `저장하지 않은 변경사항이 있습니다. '${item.name}' 공용 배치도를 복사본으로 불러오면 현재 변경사항이 사라집니다. 계속하시겠습니까?`,
+        confirmLabel: '복사본 불러오기',
+        onConfirm: loadCopy,
+      });
+    } else {
+      loadCopy();
+    }
+  };
+
   const requestDeleteSavedLayout = (item: SavedCustomLayout) => {
     setShowTemplateMenu(false);
+    const activeUser = user || auth.currentUser;
+    if (item.id === SECOND_CHILD_DOC_ID && !isSecondChildEditorEmail(activeUser?.email)) {
+      showToast('이 공용 배치도의 삭제 권한이 없습니다.');
+      return;
+    }
     setPendingConfirmAction({
       title: '저장된 배치도 삭제',
-      message: `내 배치도 목록에서 '${item.name}' 배치도를 삭제하시겠습니까? 삭제 후에는 복구할 수 없습니다.`,
+      message: `${
+        item.isPublic ? '공용 배치도' : '내 배치도'
+      } 목록에서 '${item.name}' 배치도를 삭제하시겠습니까? Firestore 저장소에서도 영구 삭제되며 복구할 수 없습니다. 필요하신 경우 JSON 내보내기를 해주시기 바랍니다.`,
       confirmLabel: '삭제하기',
       isDestructive: true,
       onConfirm: async () => {
         try {
-          await deleteDoc(doc(db, 'theaterLayouts', item.id));
+          if (item.id === SECOND_CHILD_DOC_ID) {
+            const docRef = doc(db, 'theaterLayouts', item.id);
+            const snap = await getDoc(docRef);
+            if (snap.exists()) {
+              await deleteDoc(docRef);
+            }
+            try {
+              localStorage.setItem(SECOND_CHILD_DELETED_STORAGE_KEY, 'true');
+            } catch {
+              // ignore
+            }
+          } else {
+            await deleteDoc(doc(db, 'theaterLayouts', item.id));
+          }
           if (justCreatedDocIdRef.current === item.id) {
             justCreatedDocIdRef.current = null;
           }
-          setSavedLayouts((prev) => prev.filter((saved) => saved.id !== item.id));
+          onSavedLayoutRemove?.(item.id);
+          if (!hasExternalSavedLayouts) {
+            setInternalSavedLayouts((prev) => prev.filter((saved) => saved.id !== item.id));
+          }
+          if (!hasExternalPublicLayouts) {
+            setInternalPublicLayouts((prev) => prev.filter((saved) => saved.id !== item.id));
+          }
           if (currentLayoutId === item.id) {
             setCurrentLayoutId(null);
             setSavedSignature('');
@@ -2826,6 +3210,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
               ...prev,
               savedId: undefined,
               shareCode: undefined,
+              isPublic: undefined,
             }));
           }
           showToast(`'${item.name}' 배치도가 삭제되었습니다.`);
@@ -2840,6 +3225,31 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
       },
     });
   };
+
+  const requestLoadSavedLayoutRef = useRef(requestLoadSavedLayout);
+  requestLoadSavedLayoutRef.current = requestLoadSavedLayout;
+  const requestLoadPublicLayoutCopyRef = useRef(requestLoadPublicLayoutCopy);
+  requestLoadPublicLayoutCopyRef.current = requestLoadPublicLayoutCopy;
+  const requestLoadTemplateRef = useRef(requestLoadTemplate);
+  requestLoadTemplateRef.current = requestLoadTemplate;
+  const lastHandledExternalNonceRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!externalLoadRequest) return;
+    if (lastHandledExternalNonceRef.current === externalLoadRequest.nonce) return;
+    lastHandledExternalNonceRef.current = externalLoadRequest.nonce;
+    onConsumeExternalLoadRequest?.();
+    if (externalLoadRequest.type === 'saved') {
+      if (currentLayoutIdRef.current === externalLoadRequest.item.id && !isDirtyRef.current) {
+        return;
+      }
+      requestLoadSavedLayoutRef.current(externalLoadRequest.item);
+    } else if (externalLoadRequest.type === 'public_copy') {
+      requestLoadPublicLayoutCopyRef.current(externalLoadRequest.item);
+    } else if (externalLoadRequest.type === 'blank') {
+      requestLoadTemplateRef.current('blank');
+    }
+  }, [externalLoadRequest, onConsumeExternalLoadRequest]);
 
   // -------------------------------------------------------------
   // Mouse Event Handlers on SVG Canvas (Pan, Marquee, Drag Move)
@@ -3617,13 +4027,13 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
               onClick={() => {
                 const nextOpen = !showTemplateMenu;
                 setShowTemplateMenu(nextOpen);
-                if (
-                  nextOpen &&
-                  user &&
-                  isAllowedCompanyUser(user) &&
-                  (savedLayoutsError || (!isLoadingSavedLayouts && savedLayouts.length === 0))
-                ) {
-                  void refreshSavedLayouts(user);
+                if (nextOpen && user && isAllowedCompanyUser(user)) {
+                  if (savedLayoutsError || (!isLoadingSavedLayouts && savedLayouts.length === 0)) {
+                    void refreshSavedLayouts(user);
+                  }
+                  if (publicLayoutsError || (!isLoadingPublicLayouts && publicLayouts.length === 0)) {
+                    void refreshPublicLayouts(user);
+                  }
                 }
               }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 shadow-2xs cursor-pointer"
@@ -3634,7 +4044,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             </button>
 
             {showTemplateMenu && (
-              <div className="absolute right-0 mt-2 w-76 bg-white border border-slate-200 rounded-xl shadow-xl py-2 z-40 max-h-[75vh] overflow-y-auto">
+              <div className="absolute right-0 mt-2 w-80 bg-white border border-slate-200 rounded-xl shadow-xl py-2 z-40 max-h-[75vh] overflow-y-auto">
                 {/* 1. 기존 좌석배치도에서 복사 */}
                 <div className="px-3 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
                   기존 좌석배치도에서 복사
@@ -3658,9 +4068,123 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
 
                 <div className="border-t border-slate-100 my-1.5" />
 
-                {/* 2. 내 배치도 & 공유 코드 */}
+                {/* 2. 공용 배치도 (회사 도메인 전체 공유) */}
                 <div className="px-3 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
-                  <span>내 배치도</span>
+                  <span>공용 배치도</span>
+                  <span className="text-[10px] font-semibold text-slate-400">
+                    {user ? `${publicLayouts.length}개` : '로그인 필요'}
+                  </span>
+                </div>
+                {!user ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowTemplateMenu(false);
+                      void requestLoginAndContinue('openMyLayouts');
+                    }}
+                    className="w-full text-left px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50 flex items-center justify-between cursor-pointer"
+                  >
+                    <span>공용 배치도 목록 열기</span>
+                    <span className="text-[10px] text-blue-500">로그인 필요</span>
+                  </button>
+                ) : isLoadingPublicLayouts && publicLayouts.length === 0 ? (
+                  <div className="px-3 py-2 text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <span>공용 배치도 불러오는 중...</span>
+                  </div>
+                ) : publicLayoutsError && publicLayouts.length === 0 ? (
+                  <div className="px-3 py-2 space-y-1.5">
+                    <div className="text-[11px] text-red-600 font-semibold">
+                      {publicLayoutsError}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void refreshPublicLayouts(user)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>다시 불러오기</span>
+                    </button>
+                  </div>
+                ) : publicLayouts.length === 0 ? (
+                  <div className="px-3 py-2 text-[11px] text-slate-400 font-medium">
+                    등록된 공용 배치도가 없습니다
+                  </div>
+                ) : (
+                  publicLayouts.map((item) => {
+                    const isOwner = canEditLayoutItem(item, user);
+                    const isCurrent = isOwner && currentLayoutId === item.id;
+                    const updatedLabel = formatLayoutUpdatedAtShort(
+                      item.updatedAt || item.savedAt
+                    );
+                    return (
+                      <div
+                        key={item.id}
+                        className={`flex items-center justify-between px-3 py-1.5 transition-colors ${
+                          isCurrent ? 'bg-blue-50/70' : 'hover:bg-slate-100'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => requestLoadPublicLayoutCopy(item)}
+                          className="flex-1 min-w-0 text-left cursor-pointer pr-2"
+                          title={
+                            isOwner
+                              ? `'${item.name}' 불러오기`
+                              : `'${item.name}' 복사본으로 불러오기`
+                          }
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 min-w-0">
+                              {isCurrent ? (
+                                <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                              ) : (
+                                <span className="w-3.5 shrink-0" />
+                              )}
+                              <span
+                                className={`text-xs truncate ${
+                                  isCurrent
+                                    ? 'font-bold text-blue-600'
+                                    : 'font-semibold text-slate-700'
+                                }`}
+                              >
+                                {item.name}
+                              </span>
+                            </span>
+                            <span className="text-[10px] text-slate-400 shrink-0">
+                              {isOwner ? `${item.seatCount}석` : `${item.seatCount}석 · 복사`}
+                            </span>
+                          </div>
+                          <div className="pl-5 mt-0.5 text-[10px] text-slate-400 truncate">
+                            {[item.ownerEmail || '회사 계정', updatedLabel]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </div>
+                        </button>
+                        {isOwner && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              requestDeleteSavedLayout(item);
+                            }}
+                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer shrink-0"
+                            title={`'${item.name}' 삭제`}
+                            aria-label={`'${item.name}' 삭제`}
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+
+                <div className="border-t border-slate-100 my-1.5" />
+
+                {/* 3. 저장된 내 배치도 & 공유 코드 */}
+                <div className="px-3 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                  <span>저장된 내 배치도</span>
                   <span className="text-[10px] font-semibold text-slate-400">
                     {user ? `${savedLayouts.length}개` : '로그인 필요'}
                   </span>
@@ -3746,7 +4270,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
                           title={`'${item.name}' 삭제`}
                           aria-label={`'${item.name}' 삭제`}
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     );
@@ -5161,6 +5685,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             targetId: null,
             targetName,
             isNewDoc: true,
+            isPublic: saveAsPublicInput,
           });
         };
 
@@ -5170,6 +5695,7 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
             targetId: duplicateByName.id,
             targetName: duplicateByName.name,
             isNewDoc: false,
+            isPublic: saveAsPublicInput,
             existingShareCode: duplicateByName.shareCode,
           });
         };
@@ -5230,6 +5756,21 @@ export const CustomTheaterCanvas: React.FC<CustomTheaterCanvasProps> = ({
                     className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 rounded-xl px-3 py-2 font-bold text-slate-900 text-sm outline-none"
                   />
                 </div>
+
+                <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200 hover:border-slate-300 cursor-pointer select-none transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={saveAsPublicInput}
+                    onChange={(e) => setSaveAsPublicInput(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer shrink-0"
+                  />
+                  <div className="min-w-0">
+                    <div className="font-bold text-slate-800">공용으로 저장</div>
+                    <p className="text-[11px] text-slate-500 leading-relaxed mt-0.5">
+                      체크하면 회사 계정(@lgart.com)으로 로그인한 모든 사용자가 공용 배치도 목록에서 조회하고 복사본으로 불러올 수 있습니다.
+                    </p>
+                  </div>
+                </label>
 
                 {duplicateByName ? (
                   <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 space-y-1.5">

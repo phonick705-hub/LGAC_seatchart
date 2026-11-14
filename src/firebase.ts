@@ -79,6 +79,7 @@ export interface PendingAuthRedirectPayload {
   targetDocId?: string | null;
   targetName?: string;
   isNewDoc?: boolean;
+  isPublic?: boolean;
   existingShareCode?: string;
   createdAt: number;
 }

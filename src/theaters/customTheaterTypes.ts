@@ -44,6 +44,7 @@ export interface CustomTheaterLayout {
   name: string;
   savedId?: string;
   shareCode?: string;
+  isPublic?: boolean;
   updatedAt: string;
   canvasWidth: number;
   canvasHeight: number;
@@ -57,6 +58,9 @@ export interface CustomTheaterLayout {
 export interface SavedCustomLayout {
   id: string;
   name: string;
+  ownerId?: string;
+  ownerEmail?: string;
+  isPublic?: boolean;
   shareCode?: string;
   savedAt: string;
   updatedAt?: string;

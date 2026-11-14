@@ -29,9 +29,16 @@ service cloud.firestore {
         request.auth.token.email.lower().matches('^[^@\\s]+@lgart[.]com$');
     }
 
+    function isSecondChildEditor() {
+      return isCompanyUser() &&
+        request.auth.token.email.lower() == 'vorhang@lgart.com';
+    }
+
     function isValidTheaterLayout(data) {
       return data.keys().hasAll([
         'ownerId',
+        'ownerEmail',
+        'isPublic',
         'name',
         'shareCode',
         'version',
@@ -49,6 +56,8 @@ service cloud.firestore {
       ]) &&
       data.keys().hasOnly([
         'ownerId',
+        'ownerEmail',
+        'isPublic',
         'name',
         'shareCode',
         'version',
@@ -65,6 +74,8 @@ service cloud.firestore {
         'updatedAt'
       ]) &&
       data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid &&
+      data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 128 && data.ownerEmail.lower() == request.auth.token.email.lower() &&
+      data.isPublic is bool &&
       data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
       data.shareCode is string && data.shareCode.size() >= 4 && data.shareCode.size() <= 32 && data.shareCode.matches('^[A-Z0-9\\-]+$') &&
       data.version is number && data.version >= 1 && data.version <= 100 &&
@@ -85,16 +96,21 @@ service cloud.firestore {
       allow get: if isCompanyUser() && isValidId(layoutId);
       allow list: if isCompanyUser();
       allow create: if isCompanyUser() && isValidId(layoutId) && isValidTheaterLayout(incoming()) &&
+        (layoutId != 'public_second_child' || isSecondChildEditor()) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
       allow update: if isCompanyUser() && isValidId(layoutId) && isValidTheaterLayout(incoming()) && (
         existing().ownerId == request.auth.uid &&
+        (layoutId != 'public_second_child' || isSecondChildEditor()) &&
         incoming().ownerId == existing().ownerId &&
+        (!('ownerEmail' in existing()) || incoming().ownerEmail == existing().ownerEmail) &&
         incoming().createdAt == existing().createdAt &&
         incoming().shareCode == existing().shareCode &&
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly([
           'name',
+          'ownerEmail',
+          'isPublic',
           'version',
           'schemaVersion',
           'canvasWidth',
@@ -108,7 +124,8 @@ service cloud.firestore {
           'updatedAt'
         ])
       );
-      allow delete: if isCompanyUser() && isValidId(layoutId) && existing().ownerId == request.auth.uid;
+      allow delete: if isCompanyUser() && isValidId(layoutId) && existing().ownerId == request.auth.uid &&
+        (layoutId != 'public_second_child' || isSecondChildEditor());
     }
   }
 }

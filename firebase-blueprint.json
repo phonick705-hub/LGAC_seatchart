@@ -11,6 +11,16 @@
           "minLength": 1,
           "maxLength": 128
         },
+        "ownerEmail": {
+          "type": "string",
+          "description": "Verified company email of the layout creator.",
+          "minLength": 3,
+          "maxLength": 128
+        },
+        "isPublic": {
+          "type": "boolean",
+          "description": "Whether this layout is shared in the company public layouts list."
+        },
         "name": {
           "type": "string",
           "description": "Display name of the theater seat layout.",
@@ -77,6 +87,8 @@
       },
       "required": [
         "ownerId",
+        "ownerEmail",
+        "isPublic",
         "name",
         "shareCode",
         "version",
@@ -99,7 +111,7 @@
       "schema": {
         "$ref": "#/entities/TheaterLayout"
       },
-      "description": "Private custom theater seat layouts owned by authenticated users."
+      "description": "Custom theater seat layouts (private or shared publicly within the verified company domain)."
     }
   }
 }

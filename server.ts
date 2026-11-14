@@ -7,7 +7,15 @@ import path from 'path';
 dotenv.config();
 
 function getPortAndHost() {
-  let port = Number(process.env.PORT) || 3000;
+  const defaultAppPort = Number(process.env.DEFAULT_APP_PORT) || 3000;
+  const envPort = Number(process.env.PORT);
+  const nginxPort = Number(process.env.NGINX_PORT);
+  const isProxiedByNginx = Boolean(nginxPort && envPort === nginxPort);
+
+  let port =
+    process.env.NODE_ENV === 'production' && !isProxiedByNginx && envPort
+      ? envPort
+      : defaultAppPort;
   let host = '0.0.0.0';
 
   for (let i = 0; i < process.argv.length; i++) {
@@ -38,15 +46,25 @@ app.get('/api/health', (_req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
-// 서버 측 GoogleGenAI 인스턴스 초기화 (User-Agent 필수 설정)
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// 서버 측 GoogleGenAI 인스턴스 지연 초기화 (User-Agent 필수 설정)
+let cachedAiClient: GoogleGenAI | null = null;
+function getAiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY 환경 변수가 설정되어 있지 않습니다.');
+  }
+  if (!cachedAiClient) {
+    cachedAiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+  return cachedAiClient;
+}
 
 // 추출된 Gemini 텍스트에서 4대 정보(단체명, 일시, 공연명, 좌석) 및 도면 여부 파싱 헬퍼 함수
 function parseExtractionOutput(rawOutput: string) {
@@ -398,6 +416,7 @@ function processAllExtractedData(items: ExtractedItem[]) {
 
 // Gemini 멀티모달 호출 함수 (초고속 lite 모델 우선, LOW reasoning 및 18초 호출 타임아웃 적용)
 async function generateSeatDataWithGemini(imageParts: any[]) {
+  const ai = getAiClient();
   // 우선순위:
   // 1. gemini-3.1-flash-lite: 초고속(1~3초), 큐 지연/부하 적음, 표/엑셀/도면 OCR 정확도 우수
   // 2. gemini-3.8-flash: thinkingLevel: ThinkingLevel.LOW 적용 (과도한 reasoning으로 인한 30초+ 지연 방지)
@@ -618,11 +637,19 @@ async function startServer() {
       res.sendFile(path.resolve('dist', 'index.html'));
     });
   } else {
-    const vite = await createViteServer({
+    const vitePromise = createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    vitePromise.catch((err) => {
+      console.error('Failed to initialize Vite dev server:', err);
+      process.exit(1);
+    });
+    app.use((req, res, next) => {
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
+    });
   }
 
   const server = app.listen(port, host, () => {
@@ -633,6 +660,7 @@ async function startServer() {
 
   server.on('error', (err: any) => {
     console.error('Server listen error:', err);
+    process.exit(1);
   });
 }
 

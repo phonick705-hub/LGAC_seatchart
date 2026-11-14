@@ -3,6 +3,7 @@ import {
   CustomSeat,
   CustomLabel,
   CustomLegendItem,
+  SavedCustomLayout,
 } from './customTheaterTypes';
 import { UPLUS_STAGE_ROWS, UPLUS_BALCONY_SEATS } from './uPlusStage';
 
@@ -165,6 +166,7 @@ export function sanitizeAndMigrateLayout(raw: Partial<CustomTheaterLayout>): {
         typeof raw.shareCode === 'string' && /^[A-Z0-9\-]{4,32}$/.test(raw.shareCode)
           ? raw.shareCode
           : undefined,
+      isPublic: typeof raw.isPublic === 'boolean' ? raw.isPublic : undefined,
       updatedAt:
         typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
       canvasWidth: typeof raw.canvasWidth === 'number' ? raw.canvasWidth : 1200,
@@ -291,6 +293,7 @@ export function cloneLayoutWithNewIds(
     name: options?.newName ?? sanitized.name,
     savedId: options?.preserveSavedId ? sanitized.savedId : undefined,
     shareCode: options?.preserveSavedId ? sanitized.shareCode : undefined,
+    isPublic: options?.preserveSavedId ? sanitized.isPublic : undefined,
     updatedAt: new Date().toISOString(),
     seats: clonedSeats,
     labels: clonedLabels,
@@ -1000,5 +1003,643 @@ export function createUPlusStageCopy(): CustomTheaterLayout {
     seats,
     labels,
     legend: [],
+  };
+}
+
+export function parseFirestoreTimestampIso(val: unknown): string {
+  if (
+    val &&
+    typeof val === 'object' &&
+    'toDate' in val &&
+    typeof (val as { toDate: () => Date }).toDate === 'function'
+  ) {
+    return (val as { toDate: () => Date }).toDate().toISOString();
+  }
+  if (typeof val === 'string' && val) {
+    return val;
+  }
+  return new Date().toISOString();
+}
+
+export function sortSavedLayoutsDesc(list: SavedCustomLayout[]): SavedCustomLayout[] {
+  return [...list].sort(
+    (a, b) =>
+      new Date(b.updatedAt || b.savedAt).getTime() -
+      new Date(a.updatedAt || a.savedAt).getTime()
+  );
+}
+
+export function formatLayoutUpdatedAtShort(iso?: string): string {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  return `${y}.${m}.${d} ${hh}:${mm}`;
+}
+
+export function parseFirestoreSavedLayoutDoc(
+  docId: string,
+  data: Record<string, unknown>
+): SavedCustomLayout | null {
+  try {
+    const createdIso = parseFirestoreTimestampIso(data.createdAt);
+    const updatedIso = parseFirestoreTimestampIso(data.updatedAt || data.createdAt);
+    const isPublic = data.isPublic === true;
+    const ownerId = typeof data.ownerId === 'string' ? data.ownerId : undefined;
+    const ownerEmail = typeof data.ownerEmail === 'string' ? data.ownerEmail : undefined;
+    const { layout: sanitized } = sanitizeAndMigrateLayout({
+      version: typeof data.version === 'number' ? data.version : CURRENT_SCHEMA_VERSION,
+      schemaVersion:
+        typeof data.schemaVersion === 'number'
+          ? data.schemaVersion
+          : CURRENT_SCHEMA_VERSION,
+      name: typeof data.name === 'string' ? data.name : '새 커스텀 좌석배치도',
+      savedId: docId,
+      shareCode: typeof data.shareCode === 'string' ? data.shareCode : undefined,
+      isPublic,
+      updatedAt: updatedIso,
+      canvasWidth: typeof data.canvasWidth === 'number' ? data.canvasWidth : 1200,
+      canvasHeight: typeof data.canvasHeight === 'number' ? data.canvasHeight : 800,
+      gridSize: typeof data.gridSize === 'number' ? data.gridSize : 20,
+      snapToGrid: data.snapToGrid !== false,
+      seats: Array.isArray(data.seats) ? data.seats : [],
+      labels: Array.isArray(data.labels) ? data.labels : [],
+      legend: Array.isArray(data.legend) ? data.legend : [],
+    });
+    sanitized.savedId = docId;
+    sanitized.isPublic = isPublic;
+    sanitized.shareCode =
+      typeof data.shareCode === 'string' ? data.shareCode : sanitized.shareCode;
+
+    return {
+      id: docId,
+      name: sanitized.name,
+      ownerId,
+      ownerEmail,
+      isPublic,
+      shareCode: sanitized.shareCode,
+      savedAt: createdIso,
+      updatedAt: updatedIso,
+      seatCount:
+        typeof data.seatCount === 'number'
+          ? data.seatCount
+          : sanitized.seats.filter((s) => !s.isDisabled).length,
+      layout: sanitized,
+    };
+  } catch (err) {
+    console.warn('Failed to parse saved layout document:', docId, err);
+    return null;
+  }
+}
+
+// ==============================================================
+// 공용 배치도 프리셋: '두 번째 아이' (수정 권한: vorhang@lgart.com)
+// ==============================================================
+export const SECOND_CHILD_DOC_ID = 'public_second_child';
+export const SECOND_CHILD_NAME = '두 번째 아이';
+export const SECOND_CHILD_OWNER_EMAIL = 'vorhang@lgart.com';
+export const SECOND_CHILD_SHARE_CODE = 'SEAT-SECN-CHLD';
+export const SECOND_CHILD_DELETED_STORAGE_KEY = 'deleted_builtin_second_child_v1';
+export const SECOND_CHILD_CREATED_ISO = '2026-04-01T09:00:00.000Z';
+
+export function isSecondChildEditorEmail(email?: string | null): boolean {
+  return (email || '').trim().toLowerCase() === SECOND_CHILD_OWNER_EMAIL;
+}
+
+export function createSecondChildLayout(): CustomTheaterLayout {
+  const canvasWidth = 1400;
+  const canvasHeight = 830;
+  const seatW = 50;
+  const seatH = 24;
+  const stepX = 52;
+  const stepY = 27;
+  const mainStartX = 155; // 21 columns * 52 - 2 = 1090 (right edge 1245)
+
+  const seats: CustomSeat[] = [];
+  const labels: CustomLabel[] = [];
+
+  // 1. 배경 프레임 (가장 먼저 추가하여 모든 요소 뒤에 렌더링)
+  // 2층 발코니 외곽 남색 프레임
+  labels.push({
+    id: 'sc-frame-2f',
+    text: '',
+    x: 16,
+    y: 310,
+    width: 1368,
+    height: 490,
+    fontSize: 12,
+    fontWeight: 'normal',
+    color: '#1e3a8a',
+    bgColor: '#ffffff',
+    borderColor: '#1e3a8a',
+    borderRadius: 2,
+  });
+
+  // 1층 무대 베이지 배경 영역
+  labels.push({
+    id: 'sc-stage-bg',
+    text: '',
+    x: mainStartX,
+    y: 62,
+    width: 1090,
+    height: 362,
+    fontSize: 12,
+    fontWeight: 'normal',
+    color: '#475569',
+    bgColor: '#f3efe8',
+    borderColor: '#475569',
+    borderRadius: 2,
+  });
+
+  // 상단 좌측 '1층' 헤더 셀
+  labels.push({
+    id: 'sc-header-1f',
+    text: '1층',
+    x: mainStartX,
+    y: 24,
+    width: 48,
+    height: 38,
+    fontSize: 13,
+    fontWeight: 'black',
+    color: '#ea580c',
+    bgColor: '#ffffff',
+    borderColor: '#475569',
+    borderRadius: 0,
+  });
+
+  // 상단 타이틀 바 ('LG아트센터 서울, U+ 스테이지')
+  labels.push({
+    id: 'sc-header-title',
+    text: 'LG아트센터 서울, U+ 스테이지',
+    x: mainStartX + 48,
+    y: 24,
+    width: 1042,
+    height: 38,
+    fontSize: 16,
+    fontWeight: 'black',
+    color: '#0f172a',
+    bgColor: '#d9d9d9',
+    borderColor: '#475569',
+    borderRadius: 0,
+  });
+
+  // STAGE 중앙 텍스트
+  labels.push({
+    id: 'sc-stage-text',
+    text: 'STAGE',
+    x: 660,
+    y: 205,
+    fontSize: 18,
+    fontWeight: 'black',
+    color: '#0f172a',
+  });
+
+  // 2. T구역 (좌측 16석 + 우측 14석 + 결번 흑색 박스 2개 = 활성 30석)
+  const tbW = 48;
+  const tbH = 22;
+  const tLeftColX = [206, 255];
+  const tRightColX = [358, 407];
+  const tBlockTopYs = [74, 140, 206, 272];
+
+  const tLeftBlocks: Array<[number, number, number, number]> = [
+    [1, 2, 3, 4],
+    [5, 6, 7, 8],
+    [9, 10, 11, 12],
+    [13, 14, 15, 16],
+  ];
+  tLeftBlocks.forEach((nums, bIdx) => {
+    const topY = tBlockTopYs[bIdx];
+    const coords = [
+      { n: nums[0], x: tLeftColX[0], y: topY },
+      { n: nums[1], x: tLeftColX[1], y: topY },
+      { n: nums[2], x: tLeftColX[0], y: topY + 23 },
+      { n: nums[3], x: tLeftColX[1], y: topY + 23 },
+    ];
+    coords.forEach(({ n, x, y }) => {
+      seats.push({
+        id: `sc-t-${n}`,
+        floor: '1층',
+        row: 'T구역',
+        seatNumber: n,
+        customLabel: String(n),
+        x,
+        y,
+        width: tbW,
+        height: tbH,
+        rotation: 0,
+      });
+    });
+  });
+
+  // T구역 우측 블록 1: 17, [검정], 19, [검정]
+  seats.push({
+    id: 'sc-t-17',
+    floor: '1층',
+    row: 'T구역',
+    seatNumber: 17,
+    customLabel: '17',
+    x: tRightColX[0],
+    y: tBlockTopYs[0],
+    width: tbW,
+    height: tbH,
+    rotation: 0,
+  });
+  labels.push({
+    id: 'sc-t-blk-18',
+    text: '',
+    x: tRightColX[1],
+    y: tBlockTopYs[0],
+    width: tbW,
+    height: tbH,
+    fontSize: 10,
+    fontWeight: 'normal',
+    color: '#000000',
+    bgColor: '#000000',
+    borderColor: '#000000',
+    borderRadius: 1,
+  });
+  seats.push({
+    id: 'sc-t-19',
+    floor: '1층',
+    row: 'T구역',
+    seatNumber: 19,
+    customLabel: '19',
+    x: tRightColX[0],
+    y: tBlockTopYs[0] + 23,
+    width: tbW,
+    height: tbH,
+    rotation: 0,
+  });
+  labels.push({
+    id: 'sc-t-blk-20',
+    text: '',
+    x: tRightColX[1],
+    y: tBlockTopYs[0] + 23,
+    width: tbW,
+    height: tbH,
+    fontSize: 10,
+    fontWeight: 'normal',
+    color: '#000000',
+    bgColor: '#000000',
+    borderColor: '#000000',
+    borderRadius: 1,
+  });
+
+  // T구역 우측 블록 2~4: 21~32
+  const tRightBlocks: Array<[number, number, number, number]> = [
+    [21, 22, 23, 24],
+    [25, 26, 27, 28],
+    [29, 30, 31, 32],
+  ];
+  tRightBlocks.forEach((nums, idx) => {
+    const topY = tBlockTopYs[idx + 1];
+    const coords = [
+      { n: nums[0], x: tRightColX[0], y: topY },
+      { n: nums[1], x: tRightColX[1], y: topY },
+      { n: nums[2], x: tRightColX[0], y: topY + 23 },
+      { n: nums[3], x: tRightColX[1], y: topY + 23 },
+    ];
+    coords.forEach(({ n, x, y }) => {
+      seats.push({
+        id: `sc-t-${n}`,
+        floor: '1층',
+        row: 'T구역',
+        seatNumber: n,
+        customLabel: String(n),
+        x,
+        y,
+        width: tbW,
+        height: tbH,
+        rotation: 0,
+      });
+    });
+  });
+
+  labels.push({
+    id: 'sc-label-t-zone',
+    text: 'T구역',
+    x: 312,
+    y: 198,
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+
+  // 3. B구역 (18석)
+  const bBaseX = 885;
+  const bStepX = 49;
+  const bRowsY = [122, 146, 170, 194, 218, 242];
+  // 1~6 세로열 (c=0)
+  for (let n = 1; n <= 6; n++) {
+    seats.push({
+      id: `sc-b-${n}`,
+      floor: '1층',
+      row: 'B구역',
+      seatNumber: n,
+      customLabel: String(n),
+      x: bBaseX,
+      y: bRowsY[n - 1],
+      width: tbW,
+      height: tbH,
+      rotation: 0,
+    });
+  }
+  // 7~11 세로열 (c=2)
+  for (let n = 7; n <= 11; n++) {
+    seats.push({
+      id: `sc-b-${n}`,
+      floor: '1층',
+      row: 'B구역',
+      seatNumber: n,
+      customLabel: String(n),
+      x: bBaseX + 2 * bStepX,
+      y: bRowsY[n - 7],
+      width: tbW,
+      height: tbH,
+      rotation: 0,
+    });
+  }
+  // 12, 13, 14 가로열 (Row 5, c=3..5)
+  [12, 13, 14].forEach((n, idx) => {
+    seats.push({
+      id: `sc-b-${n}`,
+      floor: '1층',
+      row: 'B구역',
+      seatNumber: n,
+      customLabel: String(n),
+      x: bBaseX + (3 + idx) * bStepX,
+      y: bRowsY[5],
+      width: tbW,
+      height: tbH,
+      rotation: 0,
+    });
+  });
+  // B구역 라벨
+  labels.push({
+    id: 'sc-label-b-zone',
+    text: 'B구역',
+    x: bBaseX + 60,
+    y: 279,
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+  // 15, 16, 17, 18 하단 가로열 (c=1..4)
+  [15, 16, 17, 18].forEach((n, idx) => {
+    seats.push({
+      id: `sc-b-${n}`,
+      floor: '1층',
+      row: 'B구역',
+      seatNumber: n,
+      customLabel: String(n),
+      x: bBaseX + (1 + idx) * bStepX,
+      y: 295,
+      width: tbW,
+      height: tbH,
+      rotation: 0,
+    });
+  });
+
+  // 4. 본당 S열 (10석: 01~10, 무대 하단 E열 06~15번 위 정렬)
+  const sRowY = 392;
+  labels.push({
+    id: 'sc-row-l-S',
+    text: 'S',
+    x: mainStartX - 28,
+    y: sRowY + 16,
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+  labels.push({
+    id: 'sc-row-r-S',
+    text: 'S',
+    x: mainStartX + 21 * stepX + 14,
+    y: sRowY + 16,
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+  for (let n = 1; n <= 10; n++) {
+    const col = 4 + n; // 5..14 (E열 06~15번 수직 정렬)
+    const numStr = String(n).padStart(2, '0');
+    seats.push({
+      id: `sc-s-${n}`,
+      floor: '1층',
+      row: 'S열',
+      seatNumber: n,
+      customLabel: `S열 ${numStr}번`,
+      x: mainStartX + col * stepX,
+      y: sRowY,
+      width: seatW,
+      height: seatH,
+      rotation: 0,
+    });
+  }
+
+  // 5. 본당 E열 ~ Q열 (21열 축 기준)
+  interface MainRowSpec {
+    letter: string;
+    startSeat: number;
+    endSeat: number;
+    disabled16?: boolean;
+    graySeats?: number[];
+  }
+  const mainRows: MainRowSpec[] = [
+    { letter: 'E', startSeat: 2, endSeat: 20, graySeats: [2, 3] },
+    { letter: 'F', startSeat: 1, endSeat: 21, disabled16: true },
+    { letter: 'G', startSeat: 1, endSeat: 21 },
+    { letter: 'H', startSeat: 1, endSeat: 21, disabled16: true },
+    { letter: 'I', startSeat: 1, endSeat: 21 },
+    { letter: 'J', startSeat: 1, endSeat: 21, disabled16: true },
+    { letter: 'K', startSeat: 1, endSeat: 21 },
+    { letter: 'L', startSeat: 1, endSeat: 21, disabled16: true },
+    { letter: 'M', startSeat: 1, endSeat: 21 },
+    { letter: 'N', startSeat: 1, endSeat: 21, disabled16: true },
+    { letter: 'O', startSeat: 1, endSeat: 21 },
+    { letter: 'P', startSeat: 3, endSeat: 20 },
+    { letter: 'Q', startSeat: 3, endSeat: 19 },
+  ];
+
+  const eRowStartY = 428;
+  mainRows.forEach((rowSpec, rIdx) => {
+    const y = eRowStartY + rIdx * stepY;
+    const rowName = `${rowSpec.letter}열`;
+
+    labels.push({
+      id: `sc-row-l-${rowSpec.letter}`,
+      text: rowSpec.letter,
+      x: mainStartX - 28,
+      y: y + 16,
+      fontSize: 11,
+      fontWeight: 'bold',
+      color: '#0f172a',
+    });
+    labels.push({
+      id: `sc-row-r-${rowSpec.letter}`,
+      text: rowSpec.letter,
+      x: mainStartX + 21 * stepX + 14,
+      y: y + 16,
+      fontSize: 11,
+      fontWeight: 'bold',
+      color: '#0f172a',
+    });
+
+    for (let n = rowSpec.startSeat; n <= rowSpec.endSeat; n++) {
+      const col = n - 1;
+      const isDisabled = Boolean(rowSpec.disabled16 && n === 16);
+      const isGray = Boolean(rowSpec.graySeats?.includes(n));
+      const numStr = String(n).padStart(2, '0');
+      seats.push({
+        id: `sc-${rowSpec.letter.toLowerCase()}-${n}`,
+        floor: '1층',
+        row: rowName,
+        seatNumber: n,
+        customLabel: `${rowName} ${numStr}번`,
+        x: mainStartX + col * stepX,
+        y,
+        width: seatW,
+        height: seatH,
+        rotation: 0,
+        ...(isDisabled ? { isDisabled: true } : {}),
+        ...(isGray ? { color: '#64748b' } : {}),
+      });
+    }
+  });
+
+  // 6. 2층 사이드 발코니 BL / BR (01~12번, 01~03번 회색)
+  const blX = 32;
+  const brX = 1316;
+  const balconyYs = [
+    365, // 01 (S열 한 칸 위)
+    sRowY, // 02 (S열 높이)
+    eRowStartY + 0 * stepY, // 03 (E열)
+    eRowStartY + 1 * stepY, // 04 (F열)
+    eRowStartY + 2 * stepY, // 05 (G열)
+    eRowStartY + 3 * stepY, // 06 (H열)
+    eRowStartY + 4 * stepY, // 07 (I열)
+    eRowStartY + 5 * stepY, // 08 (J열)
+    eRowStartY + 6 * stepY, // 09 (K열)
+    eRowStartY + 7 * stepY, // 10 (L열)
+    eRowStartY + 8 * stepY, // 11 (M열)
+    eRowStartY + 9 * stepY, // 12 (N열)
+  ];
+
+  labels.push({
+    id: 'sc-bl-title',
+    text: 'BL',
+    x: blX + 18,
+    y: 332,
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+  labels.push({
+    id: 'sc-bl-sub',
+    text: '(Balcony)',
+    x: blX + 6,
+    y: 350,
+    fontSize: 9,
+    fontWeight: 'normal',
+    color: '#475569',
+  });
+  labels.push({
+    id: 'sc-br-title',
+    text: 'BR',
+    x: brX + 18,
+    y: 332,
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  });
+  labels.push({
+    id: 'sc-br-sub',
+    text: '(Balcony)',
+    x: brX + 6,
+    y: 350,
+    fontSize: 9,
+    fontWeight: 'normal',
+    color: '#475569',
+  });
+
+  // 2층 파란색 라벨 (하단 좌측)
+  labels.push({
+    id: 'sc-label-2f',
+    text: '2층',
+    x: 46,
+    y: 774,
+    fontSize: 13,
+    fontWeight: 'black',
+    color: '#2563eb',
+  });
+
+  balconyYs.forEach((by, idx) => {
+    const n = idx + 1;
+    const numStr = String(n).padStart(2, '0');
+    const isGray = n <= 3;
+
+    seats.push({
+      id: `sc-bl-${n}`,
+      floor: '2층',
+      row: 'BL',
+      seatNumber: n,
+      customLabel: `BL열 ${numStr}번`,
+      x: blX,
+      y: by,
+      width: seatW + 2,
+      height: seatH,
+      rotation: 0,
+      ...(isGray ? { color: '#64748b' } : {}),
+    });
+
+    seats.push({
+      id: `sc-br-${n}`,
+      floor: '2층',
+      row: 'BR',
+      seatNumber: n,
+      customLabel: `BR열 ${numStr}번`,
+      x: brX,
+      y: by,
+      width: seatW + 2,
+      height: seatH,
+      rotation: 0,
+      ...(isGray ? { color: '#64748b' } : {}),
+    });
+  });
+
+  return {
+    version: CURRENT_SCHEMA_VERSION,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    name: SECOND_CHILD_NAME,
+    savedId: SECOND_CHILD_DOC_ID,
+    shareCode: SECOND_CHILD_SHARE_CODE,
+    isPublic: true,
+    updatedAt: SECOND_CHILD_CREATED_ISO,
+    canvasWidth,
+    canvasHeight,
+    gridSize: 20,
+    snapToGrid: false,
+    seats,
+    labels,
+    legend: [],
+  };
+}
+
+export function createSecondChildSavedLayout(): SavedCustomLayout {
+  const layout = createSecondChildLayout();
+  return {
+    id: SECOND_CHILD_DOC_ID,
+    name: SECOND_CHILD_NAME,
+    ownerEmail: SECOND_CHILD_OWNER_EMAIL,
+    isPublic: true,
+    shareCode: SECOND_CHILD_SHARE_CODE,
+    savedAt: SECOND_CHILD_CREATED_ISO,
+    updatedAt: SECOND_CHILD_CREATED_ISO,
+    seatCount: layout.seats.filter((s) => !s.isDisabled).length,
+    layout,
   };
 }

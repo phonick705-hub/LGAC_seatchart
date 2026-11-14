@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import {
   Copy,
   Check,
@@ -31,6 +31,7 @@ import {
   LogIn,
   LogOut,
   Mail,
+  ChevronDown,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -39,7 +40,22 @@ import {
   User,
 } from 'firebase/auth';
 import {
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+} from 'firebase/firestore';
+import {
   auth,
+  db,
+  OperationType,
+  handleFirestoreError,
   authPersistenceReady,
   signInWithGoogleAutoFallback,
   readAndClearPendingAuthRedirect,
@@ -55,6 +71,19 @@ import jsPDF from 'jspdf';
 import { TheaterId, THEATER_OPTIONS } from './theaters/types';
 import { UPlusStageMap } from './theaters/UPlusStageMap';
 import { CustomTheaterCanvas } from './theaters/CustomTheaterCanvas';
+import { SavedCustomLayout } from './theaters/customTheaterTypes';
+import {
+  CURRENT_SCHEMA_VERSION,
+  SECOND_CHILD_DELETED_STORAGE_KEY,
+  SECOND_CHILD_DOC_ID,
+  SECOND_CHILD_SHARE_CODE,
+  createSecondChildSavedLayout,
+  formatLayoutUpdatedAtShort,
+  isSecondChildEditorEmail,
+  parseFirestoreSavedLayoutDoc,
+  sortSavedLayoutsDesc,
+  stripUndefinedDeep,
+} from './theaters/customTemplates';
 import { UPLUS_VALID_SEAT_SET } from './theaters/uPlusStage';
 
 interface UploadedImageItem {
@@ -205,7 +234,7 @@ function getGradeStyle(grade: string, customNames?: Record<GradeType, string>): 
 
 function cleanRowName(rawRow: string): string {
   const trimmed = rawRow.trim();
-  if (trimmed === 'BL' || trimmed === 'BR') return trimmed;
+  if (trimmed === 'BL' || trimmed === 'BR' || trimmed.endsWith('구역')) return trimmed;
   const numMatch = trimmed.match(/^0*(\d+)열?$/);
   if (numMatch) {
     return `${parseInt(numMatch[1], 10)}열`;
@@ -318,7 +347,7 @@ function parseSeatLineOrGroup(line: string, customNames?: Record<GradeType, stri
         if (rowMatch) {
           row = `${parseInt(rowMatch[1], 10)}열`;
         } else {
-          const anyRowMatch = prefix.match(/([0-9A-Za-z가-힣]+열)/);
+          const anyRowMatch = prefix.match(/([0-9A-Za-z가-힣]+(?:열|구역))/);
           if (anyRowMatch) {
             row = cleanRowName(anyRowMatch[1]);
           } else {
@@ -415,7 +444,7 @@ function parseSeatLineOrGroup(line: string, customNames?: Record<GradeType, stri
   }
 
   // 엑셀 탭/공백 구분 행 또는 임의 컬럼 형태 (예: "한국수자원공사 1층 18열 33번 R석" 또는 "1층\t18열\t33번")
-  const flexRowMatch = trimmed.match(/(OP\d+열?|BL|BR|\d+열)/i);
+  const flexRowMatch = trimmed.match(/(OP\d+열?|BL|BR|[A-Za-z0-9가-힣]+구역|\d+열)/i);
   if (flexRowMatch) {
     const row = cleanRowName(flexRowMatch[1]);
     const finalGrade = inferGradeForSeat(floor, row, matchedGrade || undefined, customNames);
@@ -829,6 +858,34 @@ export default function App() {
   const [showShareCodeLoginPrompt, setShowShareCodeLoginPrompt] = useState<boolean>(() =>
     Boolean(readPendingShareCode())
   );
+  const [savedCustomLayouts, setSavedCustomLayouts] = useState<SavedCustomLayout[]>([]);
+  const [isLoadingSavedCustomLayouts, setIsLoadingSavedCustomLayouts] = useState<boolean>(false);
+  const [savedCustomLayoutsError, setSavedCustomLayoutsError] = useState<string | null>(null);
+  const [hasSyncedSavedCustomLayouts, setHasSyncedSavedCustomLayouts] = useState<boolean>(false);
+  const [publicCustomLayouts, setPublicCustomLayouts] = useState<SavedCustomLayout[]>([]);
+  const [isLoadingPublicCustomLayouts, setIsLoadingPublicCustomLayouts] = useState<boolean>(false);
+  const [publicCustomLayoutsError, setPublicCustomLayoutsError] = useState<string | null>(null);
+  const [hasDeletedBuiltinSecondChild, setHasDeletedBuiltinSecondChild] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SECOND_CHILD_DELETED_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const hasAttemptedSecondChildSeedRef = useRef<string | null>(null);
+  const [activeCustomLayoutId, setActiveCustomLayoutId] = useState<string | null>(null);
+  const [activeCustomLayoutName, setActiveCustomLayoutName] = useState<string | null>(null);
+  const [externalCustomLoadRequest, setExternalCustomLoadRequest] = useState<
+    | { type: 'saved'; item: SavedCustomLayout; nonce: number }
+    | { type: 'public_copy'; item: SavedCustomLayout; nonce: number }
+    | { type: 'blank'; nonce: number }
+    | null
+  >(null);
+  const [showTheaterMenu, setShowTheaterMenu] = useState<boolean>(false);
+  const theaterMenuRef = useRef<HTMLDivElement>(null);
+  const [pendingDeleteLayout, setPendingDeleteLayout] = useState<SavedCustomLayout | null>(null);
+  const [isDeletingLayout, setIsDeletingLayout] = useState<boolean>(false);
+  const justCreatedCustomDocIdRef = useRef<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<AppTab>('visual');
   const [inputText, setInputText] = useState<string>('');
@@ -1036,6 +1093,416 @@ export default function App() {
     }
   }, [authReady, authUser, selectedTheater]);
 
+  // Subscribe to saved custom layouts for the signed-in company user (visible in header dropdown & editor)
+  const refreshSavedCustomLayouts = useCallback(
+    async (targetUser?: User | null) => {
+      const activeUser = targetUser ?? authUser ?? auth.currentUser;
+      if (!activeUser || !isAllowedCompanyUser(activeUser)) return;
+      setIsLoadingSavedCustomLayouts(true);
+      setSavedCustomLayoutsError(null);
+      try {
+        const layoutsQuery = query(
+          collection(db, 'theaterLayouts'),
+          where('ownerId', '==', activeUser.uid)
+        );
+        const snapshot = await getDocs(layoutsQuery);
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null);
+        setSavedCustomLayouts((prev) => {
+          const pendingId = justCreatedCustomDocIdRef.current;
+          if (pendingId && !items.some((item) => item.id === pendingId)) {
+            const optimistic = prev.find((item) => item.id === pendingId);
+            if (optimistic) {
+              return sortSavedLayoutsDesc([optimistic, ...items]);
+            }
+          }
+          if (pendingId && items.some((item) => item.id === pendingId)) {
+            justCreatedCustomDocIdRef.current = null;
+          }
+          return sortSavedLayoutsDesc(items);
+        });
+        setHasSyncedSavedCustomLayouts(true);
+        setSavedCustomLayoutsError(null);
+      } catch (err) {
+        setSavedCustomLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+      } finally {
+        setIsLoadingSavedCustomLayouts(false);
+      }
+    },
+    [authUser]
+  );
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (!authUser || !isAllowedCompanyUser(authUser)) {
+      justCreatedCustomDocIdRef.current = null;
+      setSavedCustomLayouts([]);
+      setSavedCustomLayoutsError(null);
+      setHasSyncedSavedCustomLayouts(false);
+      setIsLoadingSavedCustomLayouts(false);
+      setActiveCustomLayoutId(null);
+      setActiveCustomLayoutName(null);
+      return;
+    }
+
+    let isEffectActive = true;
+    setIsLoadingSavedCustomLayouts(true);
+    setSavedCustomLayoutsError(null);
+    const layoutsQuery = query(
+      collection(db, 'theaterLayouts'),
+      where('ownerId', '==', authUser.uid)
+    );
+
+    const unsubscribe = onSnapshot(
+      layoutsQuery,
+      (snapshot) => {
+        if (!isEffectActive) return;
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null);
+
+        const pendingCreatedId = justCreatedCustomDocIdRef.current;
+        const hasPendingCreated = pendingCreatedId
+          ? items.some((item) => item.id === pendingCreatedId)
+          : false;
+        if (pendingCreatedId && hasPendingCreated) {
+          justCreatedCustomDocIdRef.current = null;
+        }
+
+        setSavedCustomLayouts((prev) => {
+          if (snapshot.metadata.fromCache && pendingCreatedId && !hasPendingCreated) {
+            const optimistic = prev.find((item) => item.id === pendingCreatedId);
+            if (optimistic) {
+              return sortSavedLayoutsDesc([optimistic, ...items]);
+            }
+          }
+          return sortSavedLayoutsDesc(items);
+        });
+        if (!snapshot.metadata.fromCache) {
+          setHasSyncedSavedCustomLayouts(true);
+        }
+        setSavedCustomLayoutsError(null);
+        setIsLoadingSavedCustomLayouts(false);
+      },
+      (err) => {
+        if (!isEffectActive) return;
+        setIsLoadingSavedCustomLayouts(false);
+        setSavedCustomLayoutsError('내 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+        void (async () => {
+          try {
+            const fallbackSnap = await getDocs(layoutsQuery);
+            if (!isEffectActive) return;
+            const fallbackItems = fallbackSnap.docs
+              .map((docSnap) =>
+                parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+              )
+              .filter((item): item is SavedCustomLayout => item !== null);
+            setSavedCustomLayouts((prev) => {
+              const pendingId = justCreatedCustomDocIdRef.current;
+              if (pendingId && !fallbackItems.some((item) => item.id === pendingId)) {
+                const optimistic = prev.find((item) => item.id === pendingId);
+                if (optimistic) {
+                  return sortSavedLayoutsDesc([optimistic, ...fallbackItems]);
+                }
+              }
+              return sortSavedLayoutsDesc(fallbackItems);
+            });
+            setHasSyncedSavedCustomLayouts(true);
+            setSavedCustomLayoutsError(null);
+          } catch {
+            // Keep error state for manual retry
+          }
+        })();
+      }
+    );
+
+    return () => {
+      isEffectActive = false;
+      unsubscribe();
+    };
+  }, [authReady, authUser]);
+
+  // Subscribe to public custom layouts shared across @lgart.com company accounts
+  const refreshPublicCustomLayouts = useCallback(
+    async (targetUser?: User | null) => {
+      const activeUser = targetUser ?? authUser ?? auth.currentUser;
+      if (!activeUser || !isAllowedCompanyUser(activeUser)) return;
+      setIsLoadingPublicCustomLayouts(true);
+      setPublicCustomLayoutsError(null);
+      try {
+        const publicQuery = query(
+          collection(db, 'theaterLayouts'),
+          where('isPublic', '==', true)
+        );
+        const snapshot = await getDocs(publicQuery);
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null && item.isPublic === true);
+        setPublicCustomLayouts((prev) => {
+          const pendingId = justCreatedCustomDocIdRef.current;
+          if (pendingId && !items.some((item) => item.id === pendingId)) {
+            const optimistic = prev.find((item) => item.id === pendingId && item.isPublic);
+            if (optimistic) {
+              return sortSavedLayoutsDesc([optimistic, ...items]);
+            }
+          }
+          return sortSavedLayoutsDesc(items);
+        });
+        setPublicCustomLayoutsError(null);
+      } catch (err) {
+        setPublicCustomLayoutsError('공용 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+      } finally {
+        setIsLoadingPublicCustomLayouts(false);
+      }
+    },
+    [authUser]
+  );
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (!authUser || !isAllowedCompanyUser(authUser)) {
+      setPublicCustomLayouts([]);
+      setPublicCustomLayoutsError(null);
+      setIsLoadingPublicCustomLayouts(false);
+      return;
+    }
+
+    let isEffectActive = true;
+    setIsLoadingPublicCustomLayouts(true);
+    setPublicCustomLayoutsError(null);
+    const publicQuery = query(
+      collection(db, 'theaterLayouts'),
+      where('isPublic', '==', true)
+    );
+
+    const unsubscribe = onSnapshot(
+      publicQuery,
+      (snapshot) => {
+        if (!isEffectActive) return;
+        const items = snapshot.docs
+          .map((docSnap) =>
+            parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+          )
+          .filter((item): item is SavedCustomLayout => item !== null && item.isPublic === true);
+
+        const pendingCreatedId = justCreatedCustomDocIdRef.current;
+        const hasPendingCreated = pendingCreatedId
+          ? items.some((item) => item.id === pendingCreatedId)
+          : false;
+
+        setPublicCustomLayouts((prev) => {
+          if (snapshot.metadata.fromCache && pendingCreatedId && !hasPendingCreated) {
+            const optimistic = prev.find((item) => item.id === pendingCreatedId && item.isPublic);
+            if (optimistic) {
+              return sortSavedLayoutsDesc([optimistic, ...items]);
+            }
+          }
+          return sortSavedLayoutsDesc(items);
+        });
+        setPublicCustomLayoutsError(null);
+        setIsLoadingPublicCustomLayouts(false);
+      },
+      (err) => {
+        if (!isEffectActive) return;
+        setIsLoadingPublicCustomLayouts(false);
+        setPublicCustomLayoutsError('공용 배치도 목록을 불러오지 못했습니다.');
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'theaterLayouts');
+        } catch {
+          // Logged via handleFirestoreError
+        }
+        void (async () => {
+          try {
+            const fallbackSnap = await getDocs(publicQuery);
+            if (!isEffectActive) return;
+            const fallbackItems = fallbackSnap.docs
+              .map((docSnap) =>
+                parseFirestoreSavedLayoutDoc(docSnap.id, docSnap.data() as Record<string, unknown>)
+              )
+              .filter(
+                (item): item is SavedCustomLayout => item !== null && item.isPublic === true
+              );
+            setPublicCustomLayouts((prev) => {
+              const pendingId = justCreatedCustomDocIdRef.current;
+              if (pendingId && !fallbackItems.some((item) => item.id === pendingId)) {
+                const optimistic = prev.find((item) => item.id === pendingId && item.isPublic);
+                if (optimistic) {
+                  return sortSavedLayoutsDesc([optimistic, ...fallbackItems]);
+                }
+              }
+              return sortSavedLayoutsDesc(fallbackItems);
+            });
+            setPublicCustomLayoutsError(null);
+          } catch {
+            // Keep error state for manual retry
+          }
+        })();
+      }
+    );
+
+    return () => {
+      isEffectActive = false;
+      unsubscribe();
+    };
+  }, [authReady, authUser]);
+
+  const canEditLayoutItem = useCallback(
+    (item: SavedCustomLayout, targetUser?: User | null): boolean => {
+      if (!targetUser || !isAllowedCompanyUser(targetUser)) return false;
+      if (item.id === SECOND_CHILD_DOC_ID) {
+        return (
+          isSecondChildEditorEmail(targetUser.email) &&
+          (!item.ownerId || item.ownerId === targetUser.uid)
+        );
+      }
+      return item.ownerId === targetUser.uid;
+    },
+    []
+  );
+
+  const effectivePublicCustomLayouts = useMemo(() => {
+    const hasSecondChildInFirestore = publicCustomLayouts.some(
+      (item) => item.id === SECOND_CHILD_DOC_ID
+    );
+    if (hasSecondChildInFirestore) {
+      return sortSavedLayoutsDesc(publicCustomLayouts);
+    }
+    if (hasDeletedBuiltinSecondChild && isSecondChildEditorEmail(authUser?.email)) {
+      return sortSavedLayoutsDesc(publicCustomLayouts);
+    }
+    return sortSavedLayoutsDesc([createSecondChildSavedLayout(), ...publicCustomLayouts]);
+  }, [publicCustomLayouts, hasDeletedBuiltinSecondChild, authUser]);
+
+  // Seed 'public_second_child' into Firestore once when vorhang@lgart.com signs in
+  useEffect(() => {
+    if (!authReady || !authUser || !isAllowedCompanyUser(authUser)) return;
+    if (!isSecondChildEditorEmail(authUser.email)) return;
+    if (hasDeletedBuiltinSecondChild) return;
+    if (publicCustomLayouts.some((item) => item.id === SECOND_CHILD_DOC_ID)) return;
+    if (hasAttemptedSecondChildSeedRef.current === authUser.uid) return;
+    hasAttemptedSecondChildSeedRef.current = authUser.uid;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const ref = doc(db, 'theaterLayouts', SECOND_CHILD_DOC_ID);
+        const snap = await getDoc(ref);
+        if (cancelled || snap.exists()) return;
+        const preset = createSecondChildSavedLayout();
+        const ownerEmail = (authUser.email || '').trim();
+        await setDoc(ref, {
+          ownerId: authUser.uid,
+          ownerEmail,
+          isPublic: true,
+          name: preset.name,
+          shareCode: SECOND_CHILD_SHARE_CODE,
+          version: CURRENT_SCHEMA_VERSION,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          canvasWidth: preset.layout.canvasWidth,
+          canvasHeight: preset.layout.canvasHeight,
+          gridSize: preset.layout.gridSize,
+          snapToGrid: preset.layout.snapToGrid,
+          seatCount: preset.seatCount,
+          seats: stripUndefinedDeep(preset.layout.seats),
+          labels: stripUndefinedDeep(preset.layout.labels),
+          legend: stripUndefinedDeep(preset.layout.legend || []),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.warn('Auto-seed public_second_child skipped:', err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, authUser, hasDeletedBuiltinSecondChild, publicCustomLayouts]);
+
+  const handleSavedLayoutUpsert = useCallback(
+    (item: SavedCustomLayout, isNewlyCreated?: boolean) => {
+      if (isNewlyCreated) {
+        justCreatedCustomDocIdRef.current = item.id;
+      }
+      if (item.id === SECOND_CHILD_DOC_ID) {
+        try {
+          localStorage.removeItem(SECOND_CHILD_DELETED_STORAGE_KEY);
+        } catch {
+          // ignore
+        }
+        setHasDeletedBuiltinSecondChild(false);
+      }
+      setSavedCustomLayouts((prev) => {
+        const filtered = prev.filter((existing) => existing.id !== item.id);
+        return sortSavedLayoutsDesc([item, ...filtered]);
+      });
+      setPublicCustomLayouts((prev) => {
+        const filtered = prev.filter((existing) => existing.id !== item.id);
+        if (item.isPublic) {
+          return sortSavedLayoutsDesc([item, ...filtered]);
+        }
+        return filtered;
+      });
+      setSavedCustomLayoutsError(null);
+      setActiveCustomLayoutId(item.id);
+      setActiveCustomLayoutName(item.name);
+    },
+    []
+  );
+
+  const handleSavedLayoutRemove = useCallback((docId: string) => {
+    if (justCreatedCustomDocIdRef.current === docId) {
+      justCreatedCustomDocIdRef.current = null;
+    }
+    if (docId === SECOND_CHILD_DOC_ID) {
+      try {
+        localStorage.setItem(SECOND_CHILD_DELETED_STORAGE_KEY, 'true');
+      } catch {
+        // ignore
+      }
+      setHasDeletedBuiltinSecondChild(true);
+    }
+    setSavedCustomLayouts((prev) => prev.filter((item) => item.id !== docId));
+    setPublicCustomLayouts((prev) => prev.filter((item) => item.id !== docId));
+    setActiveCustomLayoutId((prevId) => {
+      if (prevId === docId) {
+        setActiveCustomLayoutName(null);
+        return null;
+      }
+      return prevId;
+    });
+  }, []);
+
+  const handleActiveCustomLayoutChange = useCallback(
+    (docId: string | null, layoutName: string) => {
+      setActiveCustomLayoutId(docId);
+      setActiveCustomLayoutName(docId ? layoutName : null);
+    },
+    []
+  );
+
   // Automatically switch to custom editor once company user signs in with a pending ?code= link
   useEffect(() => {
     if (authReady && authUser && pendingShareCode) {
@@ -1127,11 +1594,149 @@ export default function App() {
     });
   };
 
+  useEffect(() => {
+    if (!showTheaterMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (theaterMenuRef.current && !theaterMenuRef.current.contains(e.target as Node)) {
+        setShowTheaterMenu(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowTheaterMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showTheaterMenu]);
+
+  const handleConfirmDeleteSavedLayout = async () => {
+    if (!pendingDeleteLayout || isDeletingLayout) return;
+    const target = pendingDeleteLayout;
+    const activeUser = authUser ?? auth.currentUser;
+    if (!activeUser || !isAllowedCompanyUser(activeUser)) {
+      showToast('로그인 후 배치도를 삭제할 수 있습니다.');
+      setPendingDeleteLayout(null);
+      return;
+    }
+    if (target.id === SECOND_CHILD_DOC_ID && !isSecondChildEditorEmail(activeUser.email)) {
+      showToast('이 공용 배치도의 삭제 권한이 없습니다.');
+      setPendingDeleteLayout(null);
+      return;
+    }
+
+    setIsDeletingLayout(true);
+    try {
+      if (target.id === SECOND_CHILD_DOC_ID) {
+        const docRef = doc(db, 'theaterLayouts', target.id);
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          await deleteDoc(docRef);
+        }
+      } else {
+        await deleteDoc(doc(db, 'theaterLayouts', target.id));
+      }
+      handleSavedLayoutRemove(target.id);
+      showToast(`'${target.name}' 배치도가 삭제되었습니다.`);
+    } catch (err) {
+      showToast('배치도 삭제 중 오류가 발생했습니다. 권한 및 연결 상태를 확인해 주세요.');
+      try {
+        handleFirestoreError(err, OperationType.DELETE, `theaterLayouts/${target.id}`);
+      } catch {
+        // Logged via handleFirestoreError
+      }
+    } finally {
+      setIsDeletingLayout(false);
+      setPendingDeleteLayout(null);
+    }
+  };
+
+  const handleSelectTheaterValue = (rawValue: string) => {
+    setShowTheaterMenu(false);
+    if (rawValue === 'signature' || rawValue === 'uplus') {
+      handleSelectTheater(rawValue);
+      return;
+    }
+    if (rawValue === 'custom') {
+      if (selectedTheater === 'custom' && activeCustomLayoutId !== null) {
+        setExternalCustomLoadRequest({ type: 'blank', nonce: Date.now() });
+        return;
+      }
+      setExternalCustomLoadRequest(null);
+      handleSelectTheater('custom');
+      return;
+    }
+    if (rawValue.startsWith('public:')) {
+      const targetId = rawValue.slice('public:'.length);
+      const targetItem = effectivePublicCustomLayouts.find((item) => item.id === targetId);
+      if (!targetItem) return;
+      const openPublic = (activeUser: User) => {
+        const isOwner = canEditLayoutItem(targetItem, activeUser);
+        setExternalCustomLoadRequest({
+          type: isOwner ? 'saved' : 'public_copy',
+          item: targetItem,
+          nonce: Date.now(),
+        });
+        if (selectedTheater !== 'custom') {
+          setSelectedTheater('custom');
+        }
+      };
+      if (authUser && isAllowedCompanyUser(authUser)) {
+        openPublic(authUser);
+      } else {
+        void requestCompanyLogin({
+          action: 'enterCustom',
+          theater: 'custom',
+          onSuccess: openPublic,
+        });
+      }
+      return;
+    }
+    if (rawValue.startsWith('custom:')) {
+      const targetId = rawValue.slice('custom:'.length);
+      const targetItem = savedCustomLayouts.find((item) => item.id === targetId);
+      if (!targetItem) return;
+      const openSaved = () => {
+        setExternalCustomLoadRequest({
+          type: 'saved',
+          item: targetItem,
+          nonce: Date.now(),
+        });
+        if (selectedTheater !== 'custom') {
+          setSelectedTheater('custom');
+        }
+      };
+      if (authUser && isAllowedCompanyUser(authUser)) {
+        openSaved();
+      } else {
+        void requestCompanyLogin({
+          action: 'enterCustom',
+          theater: 'custom',
+          onSuccess: openSaved,
+        });
+      }
+    }
+  };
+
   const handleHeaderSignOut = async () => {
     try {
       await signOut(auth);
       setAuthUser(null);
       setAuthError(null);
+      justCreatedCustomDocIdRef.current = null;
+      setSavedCustomLayouts([]);
+      setSavedCustomLayoutsError(null);
+      setHasSyncedSavedCustomLayouts(false);
+      setPublicCustomLayouts([]);
+      setPublicCustomLayoutsError(null);
+      setIsLoadingPublicCustomLayouts(false);
+      setActiveCustomLayoutId(null);
+      setActiveCustomLayoutName(null);
+      setExternalCustomLoadRequest(null);
       if (selectedTheater === 'custom') {
         setSelectedTheater('signature');
       }
@@ -2190,7 +2795,7 @@ export default function App() {
     const originalTitle = document.title;
     document.title = exportTitle;
 
-    // A3 또는 A4 인쇄 스타일 동적 주입 (A3 선택 시 zoom 0.77로 확대되어 단체명 및 도면이 큼직하게 1페이지 출력됨)
+    // A3 선택 시 기존 출력 대비 97% 배율(0.7469), A4 선택 시 기존 출력 대비 99% 배율(0.5346)로 1페이지 맞춤 출력
     let printStyleEl = document.getElementById('dynamic-page-print-style') as HTMLStyleElement | null;
     if (!printStyleEl) {
       printStyleEl = document.createElement('style');
@@ -2202,7 +2807,7 @@ export default function App() {
       printStyleEl.textContent = `
         @media print {
           @page { size: A3 portrait !important; margin: 6mm 8mm !important; }
-          .seat-map-print-container { zoom: 0.77 !important; transform: none !important; }
+          .seat-map-print-container { zoom: 0.7469 !important; transform: none !important; }
           .seat-map-print-title { font-size: 26pt !important; line-height: 1.2 !important; }
         }
       `;
@@ -2210,7 +2815,7 @@ export default function App() {
       printStyleEl.textContent = `
         @media print {
           @page { size: A4 portrait !important; margin: 4mm 6mm !important; }
-          .seat-map-print-container { zoom: 0.54 !important; transform: none !important; }
+          .seat-map-print-container { zoom: 0.5346 !important; transform: none !important; }
           .seat-map-print-title { font-size: 19pt !important; line-height: 1.2 !important; }
         }
       `;
@@ -2368,7 +2973,7 @@ export default function App() {
         margin: ${printPaperSize === 'A3' ? '6mm 8mm' : '4mm 6mm'};
       }
       .seat-map-print-container {
-        zoom: ${printPaperSize === 'A3' ? '0.77' : '0.54'};
+        zoom: ${printPaperSize === 'A3' ? '0.7469' : '0.5346'};
         transform: none !important;
         padding: 2px 4px !important;
         border: none !important;
@@ -4183,6 +4788,8 @@ export default function App() {
                     ? 'LG아트센터 서울, LG SIGNATURE Hall'
                     : selectedTheater === 'uplus'
                     ? 'LG아트센터 서울, U+ STAGE (End Stage)'
+                    : activeCustomLayoutId && activeCustomLayoutName
+                    ? `자유 커스텀 극장 좌석배치도 · ${activeCustomLayoutName}`
                     : '자유 커스텀 극장 좌석배치도'}
                 </div>
               </div>
@@ -4191,19 +4798,254 @@ export default function App() {
             {/* 극장 선택 메뉴 & 총 좌석 카드 & 층 필터 탭 */}
             <div className="flex flex-wrap items-center gap-3">
               {/* 극장 선택 메뉴 (웹 조작용: no-print) */}
-              <div className="no-print inline-flex items-center gap-1.5 bg-slate-100 p-1.5 rounded-xl border border-slate-200 shadow-2xs">
+              <div
+                ref={theaterMenuRef}
+                className="no-print relative inline-flex items-center gap-1.5 bg-slate-100 p-1.5 rounded-xl border border-slate-200 shadow-2xs"
+              >
                 <Building2 className="w-4 h-4 text-slate-500 ml-1 shrink-0" />
                 <span className="text-xs font-bold text-slate-700 hidden sm:inline">극장 선택:</span>
-                <select
-                  value={selectedTheater}
-                  onChange={(e) => handleSelectTheater(e.target.value as TheaterId)}
-                  className="bg-white text-slate-900 font-bold text-xs px-2.5 py-1.5 rounded-lg border border-slate-300 shadow-2xs focus:ring-2 focus:ring-red-500 cursor-pointer"
-                  aria-label="극장 선택"
-                >
-                  <option value="signature">LG SIGNATURE Hall</option>
-                  <option value="uplus">U+ STAGE (End Stage)</option>
-                  <option value="custom">새 배치 만들기 (커스텀)</option>
-                </select>
+                {(() => {
+                  const matchedActiveSaved =
+                    selectedTheater === 'custom' && activeCustomLayoutId
+                      ? savedCustomLayouts.find((item) => item.id === activeCustomLayoutId) ||
+                        effectivePublicCustomLayouts.find((item) => item.id === activeCustomLayoutId)
+                      : undefined;
+                  const currentLabel =
+                    selectedTheater === 'signature'
+                      ? 'LG SIGNATURE Hall'
+                      : selectedTheater === 'uplus'
+                      ? 'U+ STAGE (End Stage)'
+                      : matchedActiveSaved
+                      ? matchedActiveSaved.name
+                      : '새 배치 만들기 (커스텀)';
+
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setShowTheaterMenu((prev) => !prev)}
+                        className="bg-white text-slate-900 font-bold text-xs px-2.5 py-1.5 rounded-lg border border-slate-300 shadow-2xs hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer flex items-center justify-between gap-2 min-w-[175px] max-w-[240px]"
+                        aria-label="극장 선택"
+                        aria-expanded={showTheaterMenu}
+                        aria-haspopup="listbox"
+                      >
+                        <span className="truncate">{currentLabel}</span>
+                        <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      </button>
+
+                      {showTheaterMenu && (
+                        <div className="absolute left-0 top-full mt-2 w-76 bg-white border border-slate-200 rounded-xl shadow-xl py-2 z-50 max-h-[70vh] overflow-y-auto">
+                          <button
+                            type="button"
+                            onClick={() => handleSelectTheaterValue('signature')}
+                            className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between cursor-pointer transition-colors ${
+                              selectedTheater === 'signature'
+                                ? 'bg-slate-100 font-bold text-slate-900'
+                                : 'font-semibold text-slate-700 hover:bg-slate-50'
+                            }`}
+                          >
+                            <span className="flex items-center gap-1.5 min-w-0">
+                              {selectedTheater === 'signature' ? (
+                                <Check className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                              ) : (
+                                <span className="w-3.5 shrink-0" />
+                              )}
+                              <span className="truncate">LG SIGNATURE Hall</span>
+                            </span>
+                            <span className="text-[10px] text-slate-400 shrink-0">1·2·3층</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleSelectTheaterValue('uplus')}
+                            className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between cursor-pointer transition-colors ${
+                              selectedTheater === 'uplus'
+                                ? 'bg-slate-100 font-bold text-slate-900'
+                                : 'font-semibold text-slate-700 hover:bg-slate-50'
+                            }`}
+                          >
+                            <span className="flex items-center gap-1.5 min-w-0">
+                              {selectedTheater === 'uplus' ? (
+                                <Check className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                              ) : (
+                                <span className="w-3.5 shrink-0" />
+                              )}
+                              <span className="truncate">U+ STAGE (End Stage)</span>
+                            </span>
+                            <span className="text-[10px] text-slate-400 shrink-0">1층 가변형</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleSelectTheaterValue('custom')}
+                            className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between cursor-pointer transition-colors ${
+                              selectedTheater === 'custom' && !matchedActiveSaved
+                                ? 'bg-slate-100 font-bold text-slate-900'
+                                : 'font-semibold text-slate-700 hover:bg-slate-50'
+                            }`}
+                          >
+                            <span className="flex items-center gap-1.5 min-w-0">
+                              {selectedTheater === 'custom' && !matchedActiveSaved ? (
+                                <Check className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                              ) : (
+                                <span className="w-3.5 shrink-0" />
+                              )}
+                              <span className="truncate">새 배치 만들기 (커스텀)</span>
+                            </span>
+                            <span className="text-[10px] text-slate-400 shrink-0">새 캔버스</span>
+                          </button>
+
+                          {effectivePublicCustomLayouts.length > 0 && (
+                            <>
+                              <div className="border-t border-slate-100 my-1.5" />
+                              <div className="px-3 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                                <span>공용 배치도</span>
+                                <span className="text-[10px] font-semibold text-slate-400">
+                                  {effectivePublicCustomLayouts.length}개
+                                </span>
+                              </div>
+                              {effectivePublicCustomLayouts.map((item) => {
+                                const isOwner = canEditLayoutItem(item, authUser);
+                                const isCurrent =
+                                  selectedTheater === 'custom' &&
+                                  activeCustomLayoutId === item.id &&
+                                  isOwner;
+                                const updatedLabel = formatLayoutUpdatedAtShort(
+                                  item.updatedAt || item.savedAt
+                                );
+                                return (
+                                  <div
+                                    key={item.id}
+                                    className={`flex items-center justify-between px-3 py-1.5 transition-colors ${
+                                      isCurrent ? 'bg-blue-50/70' : 'hover:bg-slate-100'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSelectTheaterValue(`public:${item.id}`)}
+                                      className="flex-1 min-w-0 text-left cursor-pointer pr-1.5"
+                                      title={
+                                        isOwner
+                                          ? `'${item.name}' 불러오기`
+                                          : `'${item.name}' 복사본으로 불러오기`
+                                      }
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span className="flex items-center gap-1.5 min-w-0">
+                                          {isCurrent ? (
+                                            <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                          ) : (
+                                            <span className="w-3.5 shrink-0" />
+                                          )}
+                                          <span
+                                            className={`text-xs truncate ${
+                                              isCurrent
+                                                ? 'font-bold text-blue-600'
+                                                : 'font-semibold text-slate-700'
+                                            }`}
+                                          >
+                                            {item.name}
+                                          </span>
+                                        </span>
+                                        <span className="text-[10px] text-slate-400 shrink-0">
+                                          {isOwner ? `${item.seatCount}석` : `${item.seatCount}석 · 복사`}
+                                        </span>
+                                      </div>
+                                      <div className="pl-5 mt-0.5 text-[10px] text-slate-400 truncate">
+                                        {[item.ownerEmail || '회사 계정', updatedLabel]
+                                          .filter(Boolean)
+                                          .join(' · ')}
+                                      </div>
+                                    </button>
+                                    {isOwner && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setShowTheaterMenu(false);
+                                          setPendingDeleteLayout(item);
+                                        }}
+                                        className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer shrink-0"
+                                        title={`'${item.name}' 삭제`}
+                                        aria-label={`'${item.name}' 삭제`}
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </>
+                          )}
+
+                          {savedCustomLayouts.length > 0 && (
+                            <>
+                              <div className="border-t border-slate-100 my-1.5" />
+                              <div className="px-3 py-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                                <span>저장된 내 배치도</span>
+                                <span className="text-[10px] font-semibold text-slate-400">
+                                  {savedCustomLayouts.length}개
+                                </span>
+                              </div>
+                              {savedCustomLayouts.map((item) => {
+                                const isCurrent =
+                                  selectedTheater === 'custom' && activeCustomLayoutId === item.id;
+                                return (
+                                  <div
+                                    key={item.id}
+                                    className={`flex items-center justify-between px-3 py-1.5 transition-colors ${
+                                      isCurrent ? 'bg-blue-50/70' : 'hover:bg-slate-100'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSelectTheaterValue(`custom:${item.id}`)}
+                                      className="flex-1 min-w-0 text-left flex items-center justify-between gap-2 cursor-pointer pr-1.5"
+                                      title={`'${item.name}' 불러오기`}
+                                    >
+                                      <span className="flex items-center gap-1.5 min-w-0">
+                                        {isCurrent ? (
+                                          <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                        ) : (
+                                          <span className="w-3.5 shrink-0" />
+                                        )}
+                                        <span
+                                          className={`text-xs truncate ${
+                                            isCurrent
+                                              ? 'font-bold text-blue-600'
+                                              : 'font-semibold text-slate-700'
+                                          }`}
+                                        >
+                                          {item.name}
+                                        </span>
+                                      </span>
+                                      <span className="text-[10px] text-slate-400 shrink-0">
+                                        {item.seatCount}석
+                                      </span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setShowTheaterMenu(false);
+                                        setPendingDeleteLayout(item);
+                                      }}
+                                      className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer shrink-0"
+                                      title={`'${item.name}' 삭제`}
+                                      aria-label={`'${item.name}' 삭제`}
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               {/* 총 몇 석인지 강조 표시하는 요약 카드 */}
@@ -4648,6 +5490,20 @@ export default function App() {
                   onRequestSignOut={handleHeaderSignOut}
                   pendingShareCode={pendingShareCode}
                   onConsumePendingShareCode={handleConsumePendingShareCode}
+                  savedLayoutsProp={savedCustomLayouts}
+                  isLoadingSavedLayoutsProp={isLoadingSavedCustomLayouts}
+                  savedLayoutsErrorProp={savedCustomLayoutsError}
+                  hasSyncedSavedLayoutsProp={hasSyncedSavedCustomLayouts}
+                  publicLayoutsProp={effectivePublicCustomLayouts}
+                  isLoadingPublicLayoutsProp={isLoadingPublicCustomLayouts}
+                  publicLayoutsErrorProp={publicCustomLayoutsError}
+                  onSavedLayoutUpsert={handleSavedLayoutUpsert}
+                  onSavedLayoutRemove={handleSavedLayoutRemove}
+                  onRefreshSavedLayouts={refreshSavedCustomLayouts}
+                  onRefreshPublicLayouts={refreshPublicCustomLayouts}
+                  onActiveLayoutChange={handleActiveCustomLayoutChange}
+                  externalLoadRequest={externalCustomLoadRequest}
+                  onConsumeExternalLoadRequest={() => setExternalCustomLoadRequest(null)}
                 />
               )}
             </div>
@@ -4759,6 +5615,50 @@ export default function App() {
                   <LogIn className="w-4 h-4" />
                 )}
                 <span>Google 로그인</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* 저장된 내 배치도 삭제 확인 모달 */}
+      {pendingDeleteLayout && (
+        <div className="no-print fixed inset-0 bg-black/50 backdrop-blur-2xs flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 rounded-xl bg-red-50 text-red-600 shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-base font-black text-slate-900">
+                  저장된 배치도 삭제
+                </h3>
+                <p className="text-xs text-slate-600 font-medium leading-relaxed mt-1.5">
+                  <strong>'{pendingDeleteLayout.name}'</strong> 배치도를 삭제하시겠습니까? Firestore 저장소에서도 영구 삭제되며 복구할 수 없습니다. 필요하신 경우 JSON 내보내기를 해주시기 바랍니다.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteLayout(null)}
+                disabled={isDeletingLayout}
+                className="px-3.5 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer disabled:opacity-50"
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmDeleteSavedLayout()}
+                disabled={isDeletingLayout}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-red-600 hover:bg-red-700 text-white shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {isDeletingLayout ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                <span>삭제하기</span>
               </button>
             </div>
           </div>
